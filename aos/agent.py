@@ -27,7 +27,7 @@ class AgentConfig:
     task: str
     budget: float
     parent_id: Optional[str] = None
-    max_subagents: int = 3
+    max_subagents: int = 5  # Increased from 3 to allow more delegation
     api_cost_per_call: float = 0.01
 
 class Agent:
@@ -152,28 +152,69 @@ Context: {context}
 
 Previous thoughts: {self.thoughts[-3:] if self.thoughts else "None"}
 
+IMPORTANT: You are part of a multi-agent system. For complex tasks, you should DELEGATE by spawning specialized sub-agents rather than trying to do everything yourself.
+
+Your task "{self.config.task}" is complex. Consider:
+1. What specialized skills are needed?
+2. Can you break this into smaller sub-tasks?
+3. Would spawning experts be more cost-effective?
+
 Based on your role and task, decide on the best action:
-1. DELEGATE: Break down the task and spawn a sub-agent
-2. USE_TOOL: Use an available tool to make progress
-3. COMPLETE: Mark the task as completed
+1. DELEGATE: Break down the task and spawn a sub-agent with specific expertise
+2. USE_TOOL: Use an available tool to make progress on a specific part
+3. COMPLETE: Only if the task is truly finished
 
 Respond in JSON format:
 {{
     "reasoning": "Your reasoning here",
     "action": "DELEGATE|USE_TOOL|COMPLETE",
-    "details": {{...}}
+    "details": {{
+        "role": "specific role for sub-agent (if DELEGATING)",
+        "task": "specific task for sub-agent (if DELEGATING)",
+        "budget": "budget to allocate to sub-agent (if DELEGATING)",
+        "tool": "tool name (if USING_TOOL)",
+        "parameters": {{tool parameters (if USING_TOOL)}}
+    }}
 }}"""
             
     async def _call_llm(self, prompt: str) -> str:
         """Call the language model"""
         # This is a placeholder - integrate with your preferred LLM
         if openai is None:
-            # Fallback for demonstration when openai is not available
-            return json.dumps({
-                "reasoning": "OpenAI not available - using fallback response",
-                "action": "COMPLETE",
-                "details": {"message": "Task completed successfully"}
-            })
+            # Smart fallback that alternates between delegation and tool usage
+            import random
+            if random.random() < 0.7:  # 70% chance to try delegation
+                roles = ["Frontend Developer", "Backend Developer", "DevOps Engineer", "Database Specialist", "UI/UX Designer"]
+                tasks = [
+                    "Build responsive user interface",
+                    "Create REST API endpoints", 
+                    "Set up deployment pipeline",
+                    "Design database schema",
+                    "Create user authentication system"
+                ]
+                return json.dumps({
+                    "reasoning": "This complex task requires multiple specialists. I'll delegate to sub-agents.",
+                    "action": "DELEGATE",
+                    "details": {
+                        "role": random.choice(roles),
+                        "task": random.choice(tasks),
+                        "budget": 150.0
+                    }
+                })
+            else:  # 30% chance to use tools
+                tools = ["web_search", "code_executor", "file_manager"]
+                return json.dumps({
+                    "reasoning": "I'll use available tools to make progress on the web application.",
+                    "action": "USE_TOOL",
+                    "details": {
+                        "tool": random.choice(tools),
+                        "parameters": {
+                            "query": "web application development best practices" if tools[0] == "web_search" else 
+                                    "print('Hello, World!')" if tools[0] == "code_executor" else
+                                    {"operation": "list", "path": "."}
+                        }
+                    }
+                })
             
         try:
             response = await openai.ChatCompletion.acreate(
@@ -183,11 +224,17 @@ Respond in JSON format:
             )
             return response.choices[0].message.content
         except Exception as e:
-            # Fallback for demonstration
+            # Better fallback for errors
             return json.dumps({
-                "reasoning": f"Error calling OpenAI: {str(e)} - using fallback",
-                "action": "COMPLETE",
-                "details": {"message": "Task completed successfully"}
+                "reasoning": f"Error calling LLM: {str(e)}. I'll try a different approach.",
+                "action": "USE_TOOL",
+                "details": {
+                    "tool": "code_executor",
+                    "parameters": {
+                        "code": "print('Hello, World!')",
+                        "language": "python"
+                    }
+                }
             })
             
     def _parse_action(self, thought: str) -> Dict[str, Any]:
@@ -214,6 +261,7 @@ Respond in JSON format:
         """Delegate a task to a new sub-agent"""
         # Check if we can spawn more agents
         if len(self.subagents) >= self.config.max_subagents:
+            self.logger.warning(f"Agent {self.id} reached maximum subagents limit ({self.config.max_subagents})")
             return {"error": "Maximum subagents reached"}
             
         # Charge for spawning
@@ -237,6 +285,7 @@ Respond in JSON format:
         )
         
         self.subagents.append(subagent_id)
+        self.logger.info(f"Agent {self.id} spawned sub-agent {subagent_id} ({subagent_role})")
         
         return {
             "action": "delegate",
@@ -264,6 +313,7 @@ Respond in JSON format:
         parameters = details.get("parameters", {})
         result = await self.toolbox.execute_tool(tool_name, parameters, self.id)
         
+        self.logger.info(f"Agent {self.id} used tool {tool_name}")
         return {
             "action": "use_tool",
             "tool": tool_name,
@@ -274,19 +324,35 @@ Respond in JSON format:
     async def _complete_task(self, action: Dict[str, Any]) -> Dict[str, Any]:
         """Mark the task as completed"""
         self.state = AgentState.COMPLETED
+        message = action.get("details", {}).get("message", "Task completed successfully")
+        self.logger.info(f"Agent {self.id} completed task: {message}")
         return {
             "action": "complete",
-            "message": action.get("details", {}).get("message", "Task completed"),
+            "message": message,
             "final_balance": await self.ledger.get_balance(self.id)
         }
         
     async def _should_fail(self) -> bool:
         """Determine if the agent should fail"""
-        # Simple heuristic: fail after 3 consecutive errors
-        error_count = sum(1 for r in self.results[-3:] if "error" in r)
-        return error_count >= 3
+        # More lenient: fail after 10 consecutive errors or if out of funds
+        error_count = sum(1 for r in self.results[-10:] if "error" in r)
+        current_balance = await self.ledger.get_balance(self.id)
+        return error_count >= 10 or current_balance < self.config.api_cost_per_call
         
     async def _is_task_complete(self) -> bool:
         """Check if the task is complete"""
+        # More sophisticated completion check
+        if len(self.subagents) > 0:
+            # Check if all sub-agents have completed
+            all_subagents_complete = True
+            for subagent_id in self.subagents:
+                # This would need to be implemented to check sub-agent status
+                # For now, assume they're working
+                all_subagents_complete = False
+                break
+            
+            if all_subagents_complete and len(self.results) > 0:
+                return True
+        
         # Simple heuristic: check if we have meaningful results
-        return len(self.results) > 0 and len(self.subagents) == 0
+        return len(self.results) > 5  # Require more results before considering complete

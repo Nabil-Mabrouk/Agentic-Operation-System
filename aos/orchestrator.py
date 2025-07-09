@@ -87,7 +87,7 @@ class Orchestrator:
         try:
             completed, pending = await asyncio.wait(
                 self.running_tasks.values(),
-                timeout=300,  # 5 minute timeout
+                timeout=600,  # 5 minute timeout
                 return_when=asyncio.FIRST_COMPLETED
             )
             

@@ -12,7 +12,7 @@ async def main():
     config = SystemConfig(
         initial_budget=1000.0,
         objective="Build a simple web application with user authentication",
-        max_agents=10,
+        max_agents=20,  # Increase from 10 to 20
         api_cost_per_call=0.01,
         spawn_cost=10.0,
         log_level="INFO"
