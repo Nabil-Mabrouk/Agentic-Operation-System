@@ -1,38 +1,52 @@
 import asyncio
 import logging
 import json
-from typing import Dict, Any, List, Optional
+import os
+from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass
 from enum import Enum
+from dotenv import load_dotenv
 
-# Handle optional openai import
+load_dotenv()
+
 try:
     import openai
+    from openai import AsyncOpenAI
+    openai.api_key = os.getenv("OPENAI_API_KEY")
+    OPENAI_AVAILABLE = openai.api_key is not None
+    if OPENAI_AVAILABLE:
+        async_openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 except ImportError:
-    openai = None
+    openai, async_openai_client, OPENAI_AVAILABLE = None, None, False
 
 from .ledger import TransactionType
+# Fix the import - use direct import instead of module import
+from .prompts import FOUNDER_PLANNING_PROMPT, FOUNDER_DELEGATION_PROMPT, FOUNDER_WAITING_PROMPT, WORKER_AGENT_PROMPT
+
+# Constants
+MAX_CONSECUTIVE_ERRORS = 3
+LLM_TIMEOUT = 90.0  # seconds
+FALLBACK_RESPONSE = json.dumps({"reasoning": "Fallback due to LLM unavailability.", "action": "COMPLETE"})
 
 class AgentState(Enum):
-    """Possible states of an agent"""
     ACTIVE = "active"
     COMPLETED = "completed"
     FAILED = "failed"
-    DEAD = "dead"  # Ran out of funds
+    DEAD = "dead"
 
 @dataclass
 class AgentConfig:
-    """Configuration for an agent"""
     role: str
     task: str
     budget: float
     parent_id: Optional[str] = None
-    max_subagents: int = 5  # Increased from 3 to allow more delegation
-    api_cost_per_call: float = 0.01
+    max_subagents: int = 5
+    price_per_1m_input_tokens: float = 5.0
+    price_per_1m_output_tokens: float = 15.0
+    spawn_cost: float = 0.01
+    tool_use_cost: float = 0.005
 
 class Agent:
-    """The fundamental unit of work in AOS"""
-    
     def __init__(self, agent_id: str, config: AgentConfig, ledger, toolbox, orchestrator):
         self.id = agent_id
         self.config = config
@@ -43,316 +57,289 @@ class Agent:
         self.state = AgentState.ACTIVE
         self.subagents: List[str] = []
         self.thoughts: List[str] = []
-        self.results: List[str] = []
-        
+        self.results: List[Dict[str, Any]] = []
+        self.consecutive_errors = 0
+        self.plan: List[Dict[str, Any]] = []
+        self.plan_created = False
+
     async def initialize(self) -> bool:
-        """Initialize the agent"""
-        # Create account in ledger
         await self.ledger.create_account(self.id, self.config.budget)
-        
-        self.logger.info(f"Agent initialized: {self.config.role}")
-        self.logger.info(f"Task: {self.config.task}")
-        self.logger.info(f"Budget: ${self.config.budget:.2f}")
-        
+        self.logger.info(f"Agent initialized. Role: {self.config.role}")
         return True
-        
+
     async def think(self, context: str = "") -> str:
-        """Agent thinks about its task (calls LLM)"""
-        # Charge for API call
-        if not await self.ledger.charge(
-            self.id, 
-            self.config.api_cost_per_call,
-            TransactionType.API_CALL,
-            "LLM thinking"
-        ):
-            self.state = AgentState.DEAD
-            return "Out of funds - cannot think"
-            
-        # Prepare prompt (now async)
-        prompt = await self._build_prompt(context)
-        
-        try:
-            # Call LLM (using OpenAI as example)
-            response = await self._call_llm(prompt)
-            self.thoughts.append(response)
-            self.logger.debug(f"Agent thought: {response[:100]}...")
-            return response
-        except Exception as e:
-            self.logger.error(f"Error in think(): {str(e)}")
-            return f"Error thinking: {str(e)}"
-    
-    async def act(self, thought: str) -> Dict[str, Any]:
-        """Agent takes action based on its thought"""
-        # Parse thought to determine action
-        action = self._parse_action(thought)
-        
-        if action["type"] == "delegate":
-            return await self._delegate_task(action)
-        elif action["type"] == "use_tool":
-            return await self._use_tool(action)
-        elif action["type"] == "complete":
-            return await self._complete_task(action)
-        else:
-            return {"error": "Unknown action type"}
-            
-    async def run(self) -> Dict[str, Any]:
-        """Main execution loop for the agent"""
-        self.logger.info("Agent starting execution")
-        
-        while self.state == AgentState.ACTIVE:
-            # Think about the task
-            thought = await self.think()
-            
-            if self.state == AgentState.DEAD:
-                break
-                
-            # Act on the thought
-            result = await self.act(thought)
-            
-            # Process result
-            if "error" in result:
-                self.logger.error(f"Action failed: {result['error']}")
-                # Try to recover or fail gracefully
-                if await self._should_fail():
-                    self.state = AgentState.FAILED
-                    break
-            else:
-                self.results.append(result)
-                
-            # Check if task is complete
-            if await self._is_task_complete():
-                self.state = AgentState.COMPLETED
-                break
-                
-            # Small delay to prevent tight loops
-            await asyncio.sleep(0.1)
-            
-        self.logger.info(f"Agent finished with state: {self.state.value}")
-        return {
-            "agent_id": self.id,
-            "state": self.state.value,
-            "results": self.results,
-            "subagents": self.subagents,
-            "final_balance": await self.ledger.get_balance(self.id)
-        }
-        
-    async def _build_prompt(self, context: str) -> str:
-        """Build prompt for LLM"""
+        self.logger.debug("Thinking...")
         current_balance = await self.ledger.get_balance(self.id)
-        available_tools = await self.toolbox.list_tools()
+        if current_balance <= 0:
+            self.state = AgentState.DEAD
+            return "Out of funds"
         
-        return f"""You are an autonomous agent in the Agentic Operating System.
+        prompt = await self._build_prompt(context)
+        response_text, cost = await self._call_llm(prompt)
+        
+        if cost > 0 and not await self.ledger.charge(self.id, cost, TransactionType.API_CALL, "LLM API usage"):
+            self.state = AgentState.DEAD
+            return "Out of funds after final API call"
+        
+        if self.state != AgentState.FAILED:
+            self.thoughts.append(response_text)
+        return response_text
 
-Role: {self.config.role}
-Task: {self.config.task}
-Current Budget: ${current_balance:.2f}
-Available Tools: {available_tools}
+    async def act(self, thought: str) -> Dict[str, Any]:
+        self.logger.debug("Acting...")
+        action = self._parse_action(thought)
+        self.logger.info(f"Decided action: {action.get('type', 'N/A').upper()}")
+        
+        action_type = action.get("type")
+        if action_type == "error": return action
+        elif action_type == "delegate": return await self._delegate_task(action)
+        elif action_type == "use_tool": return await self._use_tool(action)
+        elif action_type == "complete": return await self._complete_task(action)
+        elif action_type == "fail": return {"error": thought}
+        else: return {"error": f"Unknown action type: {action_type}"}
 
-Context: {context}
+    async def run(self) -> Dict[str, Any]:
+        self.logger.info(f"Starting main execution loop.")
+        
+        if self.config.parent_id is None and not self.plan_created:
+            await self._create_plan()
 
-Previous thoughts: {self.thoughts[-3:] if self.thoughts else "None"}
-
-IMPORTANT: You are part of a multi-agent system. For complex tasks, you should DELEGATE by spawning specialized sub-agents rather than trying to do everything yourself.
-
-Your task "{self.config.task}" is complex. Consider:
-1. What specialized skills are needed?
-2. Can you break this into smaller sub-tasks?
-3. Would spawning experts be more cost-effective?
-
-Based on your role and task, decide on the best action:
-1. DELEGATE: Break down the task and spawn a sub-agent with specific expertise
-2. USE_TOOL: Use an available tool to make progress on a specific part
-3. COMPLETE: Only if the task is truly finished
-
-Respond in JSON format:
-{{
-    "reasoning": "Your reasoning here",
-    "action": "DELEGATE|USE_TOOL|COMPLETE",
-    "details": {{
-        "role": "specific role for sub-agent (if DELEGATING)",
-        "task": "specific task for sub-agent (if DELEGATING)",
-        "budget": "budget to allocate to sub-agent (if DELEGATING)",
-        "tool": "tool name (if USING_TOOL)",
-        "parameters": {{tool parameters (if USING_TOOL)}}
-    }}
-}}"""
-            
-    async def _call_llm(self, prompt: str) -> str:
-        """Call the language model"""
-        # This is a placeholder - integrate with your preferred LLM
-        if openai is None:
-            # Smart fallback that alternates between delegation and tool usage
-            import random
-            if random.random() < 0.7:  # 70% chance to try delegation
-                roles = ["Frontend Developer", "Backend Developer", "DevOps Engineer", "Database Specialist", "UI/UX Designer"]
-                tasks = [
-                    "Build responsive user interface",
-                    "Create REST API endpoints", 
-                    "Set up deployment pipeline",
-                    "Design database schema",
-                    "Create user authentication system"
-                ]
-                return json.dumps({
-                    "reasoning": "This complex task requires multiple specialists. I'll delegate to sub-agents.",
-                    "action": "DELEGATE",
-                    "details": {
-                        "role": random.choice(roles),
-                        "task": random.choice(tasks),
-                        "budget": 150.0
-                    }
-                })
-            else:  # 30% chance to use tools
-                tools = ["web_search", "code_executor", "file_manager"]
-                return json.dumps({
-                    "reasoning": "I'll use available tools to make progress on the web application.",
-                    "action": "USE_TOOL",
-                    "details": {
-                        "tool": random.choice(tools),
-                        "parameters": {
-                            "query": "web application development best practices" if tools[0] == "web_search" else 
-                                    "print('Hello, World!')" if tools[0] == "code_executor" else
-                                    {"operation": "list", "path": "."}
-                        }
-                    }
-                })
-            
-        try:
-            response = await openai.ChatCompletion.acreate(
-                model="gpt-4",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.7
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            # Better fallback for errors
-            return json.dumps({
-                "reasoning": f"Error calling LLM: {str(e)}. I'll try a different approach.",
-                "action": "USE_TOOL",
-                "details": {
-                    "tool": "code_executor",
-                    "parameters": {
-                        "code": "print('Hello, World!')",
-                        "language": "python"
-                    }
-                }
-            })
-            
-    def _parse_action(self, thought: str) -> Dict[str, Any]:
-        """Parse the agent's thought to determine action"""
-        try:
-            # Try to parse as JSON
-            data = json.loads(thought)
-            return {
-                "type": data.get("action", "COMPLETE").lower(),
-                "reasoning": data.get("reasoning", ""),
-                "details": data.get("details", {})
-            }
-        except:
-            # Fallback parsing
-            thought_lower = thought.lower()
-            if "delegate" in thought_lower or "spawn" in thought_lower:
-                return {"type": "delegate", "reasoning": thought, "details": {}}
-            elif "tool" in thought_lower:
-                return {"type": "use_tool", "reasoning": thought, "details": {}}
+        while self.state == AgentState.ACTIVE:
+            if self.config.parent_id is None:
+                action_to_take = await self._get_next_action_from_plan()
+                if action_to_take:
+                    thought = json.dumps(action_to_take)
+                else:
+                    self.logger.debug("Founder is waiting for sub-agents to complete their tasks.")
+                    if await self._is_task_complete():
+                        self.state = AgentState.COMPLETED
+                    await asyncio.sleep(2)
+                    continue
             else:
-                return {"type": "complete", "reasoning": thought, "details": {}}
-                
-    async def _delegate_task(self, action: Dict[str, Any]) -> Dict[str, Any]:
-        """Delegate a task to a new sub-agent"""
-        # Check if we can spawn more agents
-        if len(self.subagents) >= self.config.max_subagents:
-            self.logger.warning(f"Agent {self.id} reached maximum subagents limit ({self.config.max_subagents})")
-            return {"error": "Maximum subagents reached"}
+                context = f"History of your previous actions and their results: {self.results[-3:]}" if self.results else "This is your first action."
+                thought = await self.think(context)
+
+            if self.state != AgentState.ACTIVE: break
             
-        # Charge for spawning
-        spawn_cost = 10.0  # This should come from config
-        if not await self.ledger.charge(
-            self.id, spawn_cost, TransactionType.SPAWN_AGENT, "Spawning sub-agent"
-        ):
-            return {"error": "Insufficient funds to spawn sub-agent"}
+            result = await self.act(thought)
+            self.results.append(result)
+
+            if "error" in result:
+                self.logger.error(f"Action error: {result['error']}")
+                self.consecutive_errors += 1
+                if self.consecutive_errors >= MAX_CONSECUTIVE_ERRORS: self.state = AgentState.FAILED
+            else:
+                self.consecutive_errors = 0
             
-        # Create sub-agent
-        details = action.get("details", {})
-        subagent_role = details.get("role", "assistant")
-        subagent_task = details.get("task", "Assist with task")
-        subagent_budget = details.get("budget", self.config.budget * 0.3)
+            # NEW: Auto-deliver files when task is complete
+            if await self._is_task_complete():
+                await self._deliver_files()
+                self.state = AgentState.COMPLETED
+            
+            await asyncio.sleep(0.1)
         
+        self.logger.info(f"Finished execution with state: {self.state.value}")
+        return {"agent_id": self.id, "state": self.state.value}
+
+    async def _create_plan(self):
+        self.logger.info("Founder is creating a project plan...")
+        # Use the directly imported constant
+        planning_prompt = FOUNDER_PLANNING_PROMPT.format(task=self.config.task)
+        response_text, cost = await self._call_llm(planning_prompt)
+        if cost > 0:
+            await self.ledger.charge(self.id, cost, TransactionType.API_CALL, "Project Planning")
+        try:
+            plan_data = json.loads(response_text)
+            self.plan = plan_data.get("plan", [])
+            self.plan_created = True
+            self.logger.info(f"Project plan created with {len(self.plan)} steps.")
+        except json.JSONDecodeError:
+            self.logger.error("Failed to parse project plan. Agent will fail.")
+            self.state = AgentState.FAILED
+
+    async def _get_next_action_from_plan(self) -> Optional[Dict[str, Any]]:
+        if not self.plan_created or not self.plan: return None
+        completed_subagents = sum(1 for sid in self.subagents if self.orchestrator.agents.get(sid).state != AgentState.ACTIVE)
+        if completed_subagents == len(self.subagents) and len(self.plan) > len(self.subagents):
+            next_step_index = len(self.subagents)
+            self.logger.info(f"Executing step {next_step_index + 1} of the plan.")
+            return self.plan[next_step_index]
+        return None
+
+    async def _build_prompt(self, context: str) -> str:
+        # This method now acts as a router to the correct prompt template
+        balance = await self.ledger.get_balance(self.id)
+        if self.config.role.lower() == 'founder':
+            has_delegated = any(res.get("action") == "delegate" for res in self.results)
+            if has_delegated:
+                # Use directly imported constant
+                return FOUNDER_WAITING_PROMPT.format(task=self.config.task, balance=balance, context=context)
+            else:
+                # Use directly imported constant
+                return FOUNDER_DELEGATION_PROMPT.format(task=self.config.task, balance=balance, context=context)
+        else:
+            tools_list = await self.toolbox.list_tools_for_prompt()
+            tools_formatted = json.dumps(tools_list, indent=2)
+            # Use directly imported constant
+            return WORKER_AGENT_PROMPT.format(
+                role=self.config.role, task=self.config.task, balance=balance, 
+                context=context, tools_formatted=tools_formatted
+            )
+
+    async def _call_llm(self, prompt: str) -> Tuple[str, float]:
+        border = "=" * 50
+        self.logger.debug(f"\n{border}\n>>> PROMPT (Agent: {self.id}) >>>\n{border}\n{prompt}\n{border}")
+        if not OPENAI_AVAILABLE:
+            self.logger.warning("OpenAI not available, using fallback response.")
+            return FALLBACK_RESPONSE, 0.0
+
+        model = os.getenv("OPENAI_MODEL", "gpt-4-turbo")
+        api_params = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant. Respond only in the requested JSON format."},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.2,
+            "max_tokens": 2048,
+            "timeout": LLM_TIMEOUT,
+            "response_format": {"type": "json_object"}
+        }
+
+        try:
+            response = await asyncio.wait_for(
+                async_openai_client.chat.completions.create(**api_params),
+                timeout=LLM_TIMEOUT + 10.0 # Add a bit more time for network overhead
+            )
+            response_text = response.choices[0].message.content
+            self.logger.debug(f"\n{border}\n<<< RAW RESPONSE (Agent: {self.id}) <<<\n{border}\n{response_text}\n{border}")
+            usage = response.usage
+            if usage:
+                cost = ((usage.prompt_tokens / 1_000_000) * self.config.price_per_1m_input_tokens) + \
+                       ((usage.completion_tokens / 1_000_000) * self.config.price_per_1m_output_tokens)
+                return response_text, cost
+            return response_text, 0.0
+        except asyncio.TimeoutError:
+            self.logger.error(f"LLM call timed out for agent {self.id}")
+            self.state = AgentState.FAILED
+            return f"LLM call timed out after {LLM_TIMEOUT} seconds", 0.0
+        except openai.RateLimitError as e:
+            self.logger.error(f"OpenAI rate limit hit for agent {self.id}: {e}")
+            # Potentially implement retry logic here
+            self.state = AgentState.FAILED
+            return f"OpenAI rate limit error: {e}", 0.0
+        except openai.APIError as e:
+             self.logger.error(f"OpenAI API error for agent {self.id}: {e}")
+             self.state = AgentState.FAILED
+             return f"OpenAI API error: {e}", 0.0
+        except Exception as e:
+            self.state = AgentState.FAILED
+            self.logger.error(f"LLM call failed for agent {self.id}: {e}", exc_info=True)
+            return f"LLM call failed: {e}", 0.0
+
+    async def _get_fallback_response(self) -> str:
+        return json.dumps({"reasoning": "Fallback.", "action": "COMPLETE"})
+
+    def _parse_action(self, thought: str) -> Dict[str, Any]:
+        try:
+            json_start, json_end = thought.find('{'), thought.rfind('}') + 1
+            if json_start == -1: raise json.JSONDecodeError("No JSON object found.", thought, 0)
+            data = json.loads(thought[json_start:json_end])
+            action_type = data.get("action", "error").lower()
+            tool_field, details, parameters = data.get("tool"), data.get("details", {}), data.get("parameters")
+            tool_name = tool_field.get("name") if isinstance(tool_field, dict) else tool_field
+            if not parameters and "parameters" in details: parameters = details.get("parameters")
+            return {"type": action_type, "tool": tool_name, "details": details, "parameters": parameters or {}}
+        except (json.JSONDecodeError, ValueError) as e:
+            return {"type": "error", "error": f"JSON parse failed: {e}. Raw: '{thought}'"}
+
+    async def _delegate_task(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        parent_balance = await self.ledger.get_balance(self.id)
+        if parent_balance < self.config.spawn_cost:
+            return {"error": "Insufficient funds for spawn cost."}
+        spendable_balance = parent_balance - self.config.spawn_cost
+        budget_to_allocate = spendable_balance * 0.75
+        
+        if not await self.ledger.charge(self.id, self.config.spawn_cost, TransactionType.SPAWN_AGENT, "Spawning sub-agent") or \
+           not await self.ledger.charge(self.id, budget_to_allocate, TransactionType.BUDGET_ALLOCATION, "Allocating budget"):
+            await self.ledger.credit(self.id, self.config.spawn_cost, TransactionType.REFUND, "Refund for failed delegation.")
+            return {"error": "Failed to complete delegation transaction."}
+            
+        details = action.get("details", {})
         subagent_id = await self.orchestrator.spawn_agent(
-            role=subagent_role,
-            task=subagent_task,
-            budget=subagent_budget,
+            role=details.get("role", "Specialist"), 
+            task=details.get("task", "Complete assigned sub-task."), 
+            budget=budget_to_allocate, 
             parent_id=self.id
         )
         
+        if subagent_id == "error_max_agents_reached":
+            await self.ledger.credit(self.id, self.config.spawn_cost + budget_to_allocate, TransactionType.REFUND, "Refund for max agents reached.")
+            return {"error": "Maximum agents reached."}
+
         self.subagents.append(subagent_id)
-        self.logger.info(f"Agent {self.id} spawned sub-agent {subagent_id} ({subagent_role})")
-        
-        return {
-            "action": "delegate",
-            "subagent_id": subagent_id,
-            "role": subagent_role,
-            "task": subagent_task,
-            "budget": subagent_budget
-        }
-        
+        return {"action": "delegate", "subagent_id": subagent_id}
+
     async def _use_tool(self, action: Dict[str, Any]) -> Dict[str, Any]:
-        """Use a tool to perform an action"""
-        details = action.get("details", {})
-        tool_name = details.get("tool")
-        
-        if not tool_name:
-            return {"error": "No tool specified"}
-            
-        # Charge for tool usage
-        if not await self.ledger.charge(
-            self.id, 0.5, TransactionType.TOOL_USAGE, f"Using tool {tool_name}"
-        ):
+        tool_name = action.get("tool")
+        if not tool_name: return {"error": "No 'tool' name was specified."}
+        if not await self.ledger.charge(self.id, self.config.tool_use_cost, TransactionType.TOOL_USAGE, f"Using tool {tool_name}"):
             return {"error": "Insufficient funds for tool usage"}
-            
-        # Execute tool
-        parameters = details.get("parameters", {})
+        parameters = action.get("parameters", {})
         result = await self.toolbox.execute_tool(tool_name, parameters, self.id)
-        
-        self.logger.info(f"Agent {self.id} used tool {tool_name}")
-        return {
-            "action": "use_tool",
-            "tool": tool_name,
-            "parameters": parameters,
-            "result": result
-        }
-        
+        return {"action": "use_tool", "tool": tool_name, "parameters": parameters, "result": result}
+
     async def _complete_task(self, action: Dict[str, Any]) -> Dict[str, Any]:
-        """Mark the task as completed"""
         self.state = AgentState.COMPLETED
-        message = action.get("details", {}).get("message", "Task completed successfully")
-        self.logger.info(f"Agent {self.id} completed task: {message}")
-        return {
-            "action": "complete",
-            "message": message,
-            "final_balance": await self.ledger.get_balance(self.id)
-        }
-        
-    async def _should_fail(self) -> bool:
-        """Determine if the agent should fail"""
-        # More lenient: fail after 10 consecutive errors or if out of funds
-        error_count = sum(1 for r in self.results[-10:] if "error" in r)
-        current_balance = await self.ledger.get_balance(self.id)
-        return error_count >= 10 or current_balance < self.config.api_cost_per_call
-        
+        return {"action": "complete"}
+
     async def _is_task_complete(self) -> bool:
-        """Check if the task is complete"""
-        # More sophisticated completion check
-        if len(self.subagents) > 0:
-            # Check if all sub-agents have completed
-            all_subagents_complete = True
-            for subagent_id in self.subagents:
-                # This would need to be implemented to check sub-agent status
-                # For now, assume they're working
-                all_subagents_complete = False
-                break
-            
-            if all_subagents_complete and len(self.results) > 0:
-                return True
+        if self.config.parent_id is None: # Founder logic
+            if not self.plan_created or not self.plan: return False
+            all_steps_delegated = len(self.subagents) == len(self.plan)
+            if not all_steps_delegated: return False
+            return all(self.orchestrator.agents.get(sid).state != AgentState.ACTIVE for sid in self.subagents if sid in self.orchestrator.agents)
         
-        # Simple heuristic: check if we have meaningful results
-        return len(self.results) > 5  # Require more results before considering complete
+        role = self.config.role.lower() # Worker logic
+        if 'developer' in role or 'designer' in role:
+            return any(res.get("action") == "use_tool" and res.get("tool") == "file_manager" and res.get("result", {}).get("status") == "success" for res in self.results)
+        
+        return len([r for r in self.results if "error" not in r]) >= 2
+    
+
+    # Add a new method for automatic file delivery
+    async def _deliver_files(self) -> None:
+        """Automatically deliver created files to the delivery folder."""
+        if not self.toolbox.delivery_folder:
+            self.logger.debug("No delivery folder configured, skipping automatic delivery")
+            return
+        
+        # Find files that were created in this agent's workspace
+        workspace_files = []
+        try:
+            list_result = await self.toolbox.execute_tool("file_manager", {"operation": "list", "path": "."}, self.id)
+            if list_result.get("status") == "success":
+                workspace_files = list_result.get("items", [])
+        except Exception as e:
+            self.logger.error(f"Failed to list workspace files for delivery: {e}")
+            return
+        
+        # Deliver each file
+        for filename in workspace_files:
+            if filename.endswith(('.html', '.css', '.js', '.py', '.txt', '.json', '.xml')):
+                try:
+                    delivery_result = await self.toolbox.execute_tool(
+                        "file_manager", 
+                        {
+                            "operation": "copy_to_delivery",
+                            "path": filename,
+                            "delivery_name": filename  # Keep original name
+                        }, 
+                        self.id
+                    )
+                    if delivery_result.get("status") == "success":
+                        self.logger.info(f"Delivered {filename} to delivery folder")
+                    else:
+                        self.logger.warning(f"Failed to deliver {filename}: {delivery_result.get('error')}")
+                except Exception as e:
+                    self.logger.error(f"Error delivering {filename}: {e}")

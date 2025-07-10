@@ -2,62 +2,51 @@ import logging
 import sys
 from typing import Optional
 
-def setup_logger(name: str, level: str = "INFO") -> logging.Logger:
+def setup_logging(level: str = "INFO", log_file: Optional[str] = None) -> None:
     """
-    Set up a logger with the specified name and level.
-    
-    Args:
-        name: The name of the logger
-        level: The logging level (DEBUG, INFO, WARNING, ERROR)
-        
-    Returns:
-        A configured logger instance
-    """
-    # Create logger
-    logger = logging.getLogger(name)
-    
-    # Set level
-    numeric_level = getattr(logging, level.upper(), logging.INFO)
-    logger.setLevel(numeric_level)
-    
-    # Create console handler if not already added
-    if not logger.handlers:
-        # Create console handler
-        console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setLevel(numeric_level)
-        
-        # Create formatter
-        formatter = logging.Formatter(
-            '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
-        )
-        console_handler.setFormatter(formatter)
-        
-        # Add handler to logger
-        logger.addHandler(console_handler)
-    
-    return logger
+    Configures the root logger for the entire application.
+    This should be called only ONCE when the application starts.
 
-def get_logger(name: str) -> logging.Logger:
-    """
-    Get an existing logger by name.
-    
     Args:
-        name: The name of the logger
-        
-    Returns:
-        A logger instance
-    """
-    return logging.getLogger(name)
+        level: The log level (DEBUG, INFO, WARNING, ERROR, CRITICAL).
+        log_file: Optional path to a log file. If provided, logs will also be written to this file.
 
-# Configure the root logger for the aos package
-def configure_root_logger(level: str = "INFO") -> None:
+    Example:
+        setup_logging(level="DEBUG", log_file="aos.log")
     """
-    Configure the root logger for the entire aos package.
+    root_logger = logging.getLogger()
     
-    Args:
-        level: The logging level (DEBUG, INFO, WARNING, ERROR)
-    """
-    root_logger = logging.getLogger("aos")
-    if not root_logger.handlers:
-        setup_logger("aos", level)
+    # Validate and set log level
+    numeric_level = getattr(logging, level.upper(), None)
+    if not isinstance(numeric_level, int):
+        logging.warning(f"Invalid log level: {level}. Defaulting to INFO.")
+        numeric_level = logging.INFO
+    root_logger.setLevel(numeric_level)
+    
+    # Avoid adding duplicate handlers
+    if root_logger.handlers:
+        logging.info("Logging already configured. Skipping setup.")
+        return
+
+    # Create formatter
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)-25s - %(levelname)-8s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+
+    # Console handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
+    root_logger.addHandler(console_handler)
+
+    # File handler (if specified)
+    if log_file:
+        try:
+            file_handler = logging.FileHandler(log_file)
+            file_handler.setFormatter(formatter)
+            root_logger.addHandler(file_handler)
+            logging.info(f"Logging to file: {log_file}")
+        except Exception as e:
+            logging.error(f"Failed to set up file logging to {log_file}: {e}")
+
+    logging.info(f"Root logger configured with level {logging.getLevelName(numeric_level)}")

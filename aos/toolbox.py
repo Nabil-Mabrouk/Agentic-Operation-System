@@ -1,102 +1,72 @@
-import asyncio
+# aos/toolbox.py
+import os
 import logging
-from typing import Dict, Any, Callable, Optional, List
-from abc import ABC, abstractmethod
-import importlib.util
-import sys
-from .tools.base_tool import BaseTool
+from typing import Dict, Any, List, Optional
+import asyncio
+
+from .tools.base_tool import BaseTool, ToolError
 
 class Toolbox:
-    """The Shared Library - dynamic registry of tools available to agents"""
+    """A collection of tools sandboxed to a specific agent's workspace."""
     
-    def __init__(self):
+    def __init__(self, workspace_dir: str, delivery_folder: Optional[str] = None):
         self.logger = logging.getLogger("AOS-Toolbox")
         self.tools: Dict[str, BaseTool] = {}
-        self._lock = asyncio.Lock()
+        self.workspace_dir = workspace_dir
+        self.delivery_folder = delivery_folder
+        self._lock = asyncio.Lock()  # Ensure thread safety for tool registration
         
     async def initialize(self) -> None:
-        """Initialize the toolbox with basic tools"""
-        self.logger.info("Initializing toolbox...")
-        
-        # Load built-in tools
-        await self._load_builtin_tools()
-        
-    async def _load_builtin_tools(self) -> None:
-        """Load built-in tools"""
-        from .tools.web_search import WebSearchTool
-        from .tools.code_executor import CodeExecutorTool
-        from .tools.file_manager import FileManagerTool
+        """Initialize the toolbox with tools configured for its workspace."""
+        self.logger.info(f"Initializing toolbox for workspace: {self.workspace_dir}")
+        from aos.tools import WebSearchTool, CodeExecutorTool, FileManagerTool
         
         builtin_tools = [
             WebSearchTool(),
             CodeExecutorTool(),
-            FileManagerTool()
+            FileManagerTool(workspace_dir=self.workspace_dir, delivery_folder=self.delivery_folder)
         ]
         
         for tool in builtin_tools:
             await self.register_tool(tool)
+        self.logger.info(f"Toolbox initialized with {len(self.tools)} tools.")
+        
+        # Create delivery folder if specified
+        if self.delivery_folder:
+            os.makedirs(self.delivery_folder, exist_ok=True)
+            self.logger.info(f"Delivery folder created at: {self.delivery_folder}")
             
     async def register_tool(self, tool: BaseTool) -> None:
-        """Register a new tool in the toolbox"""
         async with self._lock:
             if tool.name in self.tools:
-                self.logger.warning(f"Tool {tool.name} already exists, overwriting")
+                self.logger.warning(f"Tool '{tool.name}' is already registered. Overwriting.")
             self.tools[tool.name] = tool
-            self.logger.info(f"Tool {tool.name} registered")
+            self.logger.debug(f"Registered tool: {tool.name}")
             
     async def get_tool(self, name: str) -> Optional[BaseTool]:
-        """Get a tool by name"""
         return self.tools.get(name)
         
-    async def list_tools(self) -> List[str]:
-        """List all available tools"""
-        return list(self.tools.keys())
+    async def list_tools_for_prompt(self) -> List[Dict[str, Any]]:
+        """Returns a detailed list of tools with schemas for the LLM prompt."""
+        return [{
+            "name": tool.name,
+            "description": tool.description,
+            "parameters_schema": tool.get_schema()
+        } for name, tool in self.tools.items()]
         
     async def execute_tool(self, name: str, parameters: Dict[str, Any], agent_id: str) -> Dict[str, Any]:
-        """Execute a tool with given parameters"""
         tool = await self.get_tool(name)
         if not tool:
-            return {"error": f"Tool {name} not found"}
-            
+            error_msg = f"Tool '{name}' not found."
+            self.logger.error(f"Agent {agent_id}: {error_msg}")
+            return {"error": error_msg, "code": "TOOL_NOT_FOUND"}
+        
+        self.logger.info(f"Agent {agent_id} executing tool: {name} with params: {parameters}")
         try:
             result = await tool.execute(parameters, agent_id)
-            self.logger.debug(f"Tool {name} executed by {agent_id}")
+            self.logger.debug(f"Tool {name} executed successfully for agent {agent_id}. Result: {result}")
             return result
         except Exception as e:
-            self.logger.error(f"Error executing tool {name}: {str(e)}")
-            return {"error": str(e)}
-            
-    async def load_dynamic_tool(self, tool_code: str, tool_name: str) -> bool:
-        """Dynamically load a tool from code"""
-        try:
-            # Create a temporary module
-            spec = importlib.util.spec_from_loader(tool_name, loader=None)
-            module = importlib.util.module_from_spec(spec)
-            
-            # Execute the tool code
-            exec(tool_code, module.__dict__)
-            
-            # Find the tool class (should inherit from BaseTool)
-            tool_class = None
-            for item_name in dir(module):
-                item = getattr(module, item_name)
-                if (isinstance(item, type) and 
-                    issubclass(item, BaseTool) and 
-                    item != BaseTool):
-                    tool_class = item
-                    break
-                    
-            if not tool_class:
-                self.logger.error(f"No valid tool class found in dynamic tool {tool_name}")
-                return False
-                
-            # Instantiate and register the tool
-            tool_instance = tool_class()
-            await self.register_tool(tool_instance)
-            
-            self.logger.info(f"Dynamically loaded tool: {tool_name}")
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Failed to load dynamic tool {tool_name}: {str(e)}")
-            return False
+            error_msg = f"Tool '{name}' execution failed: {str(e)}"
+            self.logger.error(f"Agent {agent_id}: {error_msg}", exc_info=True)
+            return {"error": error_msg, "code": "EXECUTION_FAILED", "details": str(e)}

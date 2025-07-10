@@ -3,3 +3,6 @@ aiohttp>=3.8.0
 asyncio
 dataclasses
 typing-extensions
+python-dotenv>=1.0.0
+python-dotenv
+duckduckgo-search
