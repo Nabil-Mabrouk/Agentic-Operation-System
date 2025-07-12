@@ -26,24 +26,42 @@ class OpenAICompatibleClient(BaseLLMClient):
         self.logger.info(f"Initialized OpenAI-compatible client for base URL: {base_url}")
 
     async def call_llm(self, prompt: str, config: LLMConfig) -> Tuple[str, int, int]:
-        api_params = {
+        base_params = {
             "model": config.model,
             "messages": [
                 {"role": "system", "content": "You are a helpful assistant. Respond only in the requested JSON format."},
                 {"role": "user", "content": prompt}
             ],
             "temperature": config.temperature,
-            "max_tokens": config.max_tokens,
             "timeout": config.timeout,
         }
-        # Certains modèles compatibles ne supportent pas le 'response_format'.
-        # On l'ajoute conditionnellement.
-        # if config.provider in ["openai"]: # ou une autre logique
-        #     api_params["response_format"] = {"type": "json_object"}
+        # Adapter les paramètres en fonction du modèle ou du fournisseur
+        # C'est une heuristique, mais elle est efficace.
+        # Les modèles plus récents (comme gpt-4o) utilisent 'max_completion_tokens'
+        # On peut se baser sur le nom du modèle ou le fournisseur.
+        if "gpt-4-turbo" in config.model:
+            # Les anciens modèles turbo pourraient encore utiliser max_tokens
+             base_params["max_tokens"] = config.max_tokens
+             base_params["response_format"] = {"type": "json_object"}
+        else:
+            # Pour les modèles plus récents ou les API compatibles comme Groq
+            base_params["max_tokens"] = config.max_tokens # on garde max_tokens au cas où
+                                                          # mais on pourrait utiliser max_completion_tokens
+            # `response_format` n'est pas toujours supporté par les API compatibles
+            if config.provider == "openai":
+                base_params["response_format"] = {"type": "json_object"}
+
+
+        # Supprimons le paramètre qui pose problème si le modèle est connu pour ne pas le supporter
+        # Pour cet exemple, on peut simplement faire un switch manuel
+        # Une solution plus avancée serait d'avoir une config par modèle.
+        # Ici, nous allons simplement renommer le paramètre.
+        if 'max_tokens' in base_params:
+            base_params['max_completion_tokens'] = base_params.pop('max_tokens')
 
         try:
             response = await asyncio.wait_for(
-                self.client.chat.completions.create(**api_params),
+                self.client.chat.completions.create(**base_params),
                 timeout=config.timeout + 10.0
             )
             response_text = response.choices[0].message.content

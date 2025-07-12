@@ -25,22 +25,51 @@ class OpenAIClient(BaseLLMClient):
     # --- AJOUTER LE CONSTRUCTEUR ---
     def __init__(self):
         self.logger = logging.getLogger("AOS-LLM-OpenAI")
+
+    def _adapt_parameters(self, config: LLMConfig) -> dict[str, any]:
+        """
+        Adapts the generic LLMConfig to the specific requirements of an OpenAI model.
+        """
+        params = {
+            "model": config.model,
+            "temperature": config.temperature,
+            "timeout": config.timeout,
+        }
+
+        # Logique d'adaptation pour max_tokens
+        # Les modèles 'o' (comme gpt-4o) et certains modèles récents utilisent 'max_completion_tokens'
+        if 'o' in config.model or 'mini' in config.model:
+             params["max_completion_tokens"] = config.max_tokens
+        else:
+             params["max_tokens"] = config.max_tokens
+
+
+
+        # Logique d'adaptation pour response_format (si nécessaire pour d'autres fournisseurs)
+        if config.provider == "openai":
+            params["response_format"] = {"type": "json_object"}
+            
+        return params
+
+
+    
     async def call_llm(self, prompt: str, config: LLMConfig) -> Tuple[str, int, int]:
         if not OPENAI_AVAILABLE:
             # Gérer le cas où OpenAI n'est pas disponible
             return '{"reasoning": "Fallback due to LLM unavailability.", "action": "FAIL"}', 0, 0
 
-        api_params = {
-            "model": config.model,
-            "messages": [
-                {"role": "system", "content": "You are a helpful assistant. Respond only in the requested JSON format."},
-                {"role": "user", "content": prompt}
-            ],
-            "temperature": config.temperature,
-            "max_tokens": config.max_tokens,
-            "timeout": config.timeout,
-            "response_format": {"type": "json_object"}
-        }
+        # --- NOUVELLE LOGIQUE ---
+        # 1. Construire les messages
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant. Respond only in the requested JSON format."},
+            {"role": "user", "content": prompt}
+        ]
+
+        # 2. Adapter les paramètres
+        api_params = self._adapt_parameters(config)
+        api_params["messages"] = messages
+        
+        self.logger.debug(f"Calling LLM with adapted parameters: {api_params}")
 
         try:
             response = await asyncio.wait_for(
