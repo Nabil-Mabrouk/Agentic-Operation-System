@@ -8,7 +8,7 @@ python-dotenv
 duckduckgo-search
 pytest
 pytest-asyncio
-"typer[all]"
+typer[all]
 websockets
 httpx
 pytest-httpx

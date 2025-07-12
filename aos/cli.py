@@ -5,7 +5,7 @@ import os
 import shutil
 import webbrowser
 import traceback
-
+from typing import Literal, Optional, Dict, Any, List 
 from .bootstrap import Bootstrap, SystemConfig
 from .config import LLMConfig, AgentCapabilities
 
@@ -80,7 +80,9 @@ def run(
     # --- NOUVELLES OPTIONS DE CAPACITÉS ---
     messaging: bool = typer.Option(True, "--messaging/--no-messaging", help="Enable/Disable inter-agent messaging."),
     advanced_planning: bool = typer.Option(True, "--adv-planning/--no-adv-planning", help="Enable/Disable the advanced planning validation loop."),
-    tool_creation: bool = typer.Option(False, "--tool-creation/--no-tool-creation", help="Enable/Disable the agent's ability to create new tools.")
+    tool_creation: bool = typer.Option(False, "--tool-creation/--no-tool-creation", help="Enable/Disable the agent's ability to create new tools."),
+    disable_tool: List[str] = typer.Option(None, "--disable-tool", help="Disable a specific tool by name. Can be used multiple times."),
+
 ):
     """
     Run a new AOS simulation with a given objective.
@@ -102,7 +104,8 @@ def run(
         max_agents=max_agents,
         log_level=log_level.upper(),
         llm=llm_config,  # Passer la configuration LLM
-        capabilities=capabilities  # Passer la configuration des capacités
+        capabilities=capabilities,  # Passer la configuration des capacités
+        disabled_tools=disable_tool,
     )
 
     # L'unique point d'entrée asyncio.

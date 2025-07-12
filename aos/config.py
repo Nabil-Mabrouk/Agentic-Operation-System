@@ -1,7 +1,7 @@
 #aos/config.py
 import logging
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, Optional, Dict, Any, List
 import os
 # Define valid log levels
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
@@ -11,7 +11,7 @@ class LLMConfig:
     """Configuration for the Language Model client."""
     provider: str = "openai"  # Pourrait être 'anthropic', 'google', 'ollama' etc. à l'avenir
     model: str = os.getenv("AOS_MODEL_NAME", "o4-mini-2025-04-16")
-    temperature: float = 0.6
+    temperature: float = 1
     max_tokens: int = 4000
     timeout: float = 90.0
     # On peut ajouter d'autres paramètres spécifiques ici
@@ -56,6 +56,7 @@ class SystemConfig:
     #delivery_folder: str = "./delivery"
     simulation_timeout: float = 600.0 # <--- NOUVELLE LIGNE
     shutdown_timeout: float = 10.0 # <--- NOUVELLE LIGNE
+    disabled_tools: List[str] = field(default_factory=list)
     llm: LLMConfig = field(default_factory=LLMConfig)
     capabilities: AgentCapabilities = field(default_factory=AgentCapabilities)
 

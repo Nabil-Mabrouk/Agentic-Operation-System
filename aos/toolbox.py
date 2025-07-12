@@ -36,19 +36,24 @@ class Toolbox:
                     # On cherche les classes qui héritent de BaseTool mais qui ne sont pas BaseTool elles-mêmes
                     if inspect.isclass(obj) and issubclass(obj, BaseTool) and obj is not BaseTool:
                         self.logger.debug(f"Found tool class: {obj.__name__} in {module_name}")
-                        
+
                         # Instancier l'outil. Gérer le cas de FileManagerTool qui a des arguments.
                         if obj.__name__ == "FileManagerTool":
                             tool_instance = obj(workspace_dir=self.workspace_dir, delivery_folder=self.delivery_folder)
                         else:
                             tool_instance = obj()
                         
+                        if tool_instance.name in self.orchestrator.config.disabled_tools:
+                            self.logger.warning(f"Tool '{tool_instance.name}' is disabled by configuration. Skipping.")
+                            continue # On ne charge pas cet outil    
+
                         # Dans la boucle de chargement dynamique
                         if obj.__name__ == "MessagingTool" and not self.orchestrator.config.capabilities.allow_messaging:
                             continue # On saute le chargement de cet outil
 
                         await self.register_tool(tool_instance)
-                        
+                                            # --- VÉRIFICATION DE DÉSACTIVATION ---
+
             except ImportError as e:
                 self.logger.error(f"Failed to import plugin module {module_name}: {e}")
 
