@@ -1,8 +1,8 @@
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 import asyncio
 import subprocess
 import sys
-from .base_tool import BaseTool
+from aos.tools.base_tool import BaseTool, ToolError
 
 # Constants
 CODE_EXECUTION_TIMEOUT = 30.0  # seconds
@@ -27,7 +27,7 @@ class CodeExecutorTool(BaseTool):
             "required": ["code"]
         }
 
-    async def execute(self, parameters: Dict[str, Any], agent_id: str) -> Dict[str, Any]:
+    async def execute(self, parameters: Dict[str, Any], agent_id: str, orchestrator: Optional[Any] = None) -> Dict[str, Any]:
         code = parameters.get("code")
         if not code:
             return {"error": "'code' parameter is required.", "code": "INVALID_PARAMETERS"}

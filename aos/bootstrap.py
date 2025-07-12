@@ -6,6 +6,7 @@ from .orchestrator import Orchestrator
 from .ledger import Ledger
 from .toolbox import Toolbox
 from .utils.logger import setup_logging
+from .llm_clients import get_llm_client # <--- NOUVEL IMPORT
 
 class Bootstrap:
     """The BIOS of the Agentic Operating System"""
@@ -19,8 +20,8 @@ class Bootstrap:
         self.ledger: Optional[Ledger] = None
         self.toolbox: Optional[Toolbox] = None
         self.orchestrator: Optional[Orchestrator] = None
+        self.llm_client = None # <--- NOUVEL ATTRIBUT
         
-    # aos/bootstrap.py (updated initialize method)
     async def initialize(self) -> None:
         """Initialize all system components"""
         self.logger.info("Initializing AOS-v0...")
@@ -30,21 +31,33 @@ class Bootstrap:
             self.ledger = Ledger()
             await self.ledger.initialize()
             
-            self.logger.debug("Initializing Toolbox...")
-            # Pass the delivery folder to Toolbox
-            self.toolbox = Toolbox(workspace_dir="./workspace", delivery_folder=self.config.delivery_folder)
-            await self.toolbox.initialize()
+            # --- MODIFICATION DE L'ORDRE ---
+
+            # 1. Initialiser le client LLM
+            self.logger.debug(f"Initializing LLM client for provider: {self.config.llm.provider}")
+            self.llm_client = get_llm_client(self.config.llm.provider)
             
+            # 2. Initialiser l'Orchestrateur D'ABORD
             self.logger.debug("Initializing Orchestrator...")
             self.orchestrator = Orchestrator(
                 ledger=self.ledger,
-                config=self.config
+                config=self.config,
+                llm_client=self.llm_client
             )
             await self.orchestrator.initialize()
+
+            # 3. Initialiser le Toolbox ENSUITE, en lui passant l'orchestrateur
+            self.logger.debug("Initializing Bootstrap's root Toolbox...")
+            self.toolbox = Toolbox(
+                workspace_dir=self.config.workspace_path,
+                delivery_folder=self.config.delivery_path,
+                orchestrator=self.orchestrator # <--- PASSER LA RÉFÉRENCE
+            )
+            await self.toolbox.initialize()
             
             self.logger.info("AOS-v0 initialization complete")
         except Exception as e:
-            self.logger.error(f"Initialization failed: {e}")
+            self.logger.error(f"Initialization failed: {e}", exc_info=True) # Ajout de exc_info
             await self.shutdown()
             raise
         

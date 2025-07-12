@@ -6,3 +6,9 @@ typing-extensions
 python-dotenv>=1.0.0
 python-dotenv
 duckduckgo-search
+pytest
+pytest-asyncio
+"typer[all]"
+websockets
+httpx
+pytest-httpx

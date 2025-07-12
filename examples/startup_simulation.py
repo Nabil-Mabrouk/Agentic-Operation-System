@@ -36,7 +36,8 @@ async def main():
     print(f"Objective: {config.objective}")
     print("-" * 50)
     
-    workspace_dir = "./workspace"
+    # Utilise le nouveau chemin de la configuration
+    workspace_dir = config.workspace_path 
     if os.path.exists(workspace_dir):
         shutil.rmtree(workspace_dir)
     os.makedirs(workspace_dir)

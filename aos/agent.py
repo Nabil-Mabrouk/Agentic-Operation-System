@@ -6,23 +6,20 @@ from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass
 from enum import Enum
 from dotenv import load_dotenv
+from .exceptions import MaxAgentsReachedError
 
 load_dotenv()
 
-try:
-    import openai
-    from openai import AsyncOpenAI
-    openai.api_key = os.getenv("OPENAI_API_KEY")
-    OPENAI_AVAILABLE = openai.api_key is not None
-    if OPENAI_AVAILABLE:
-        async_openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-except ImportError:
-    openai, async_openai_client, OPENAI_AVAILABLE = None, None, False
 
 from .ledger import TransactionType
 # Fix the import - use direct import instead of module import
-from .prompts import FOUNDER_PLANNING_PROMPT, FOUNDER_DELEGATION_PROMPT, FOUNDER_WAITING_PROMPT, WORKER_AGENT_PROMPT
-
+from .prompts import (
+    FOUNDER_PLANNING_PROMPT, 
+    FOUNDER_DELEGATION_PROMPT, 
+    FOUNDER_WAITING_PROMPT, 
+    WORKER_AGENT_PROMPT, 
+    ARCHITECT_VALIDATION_PROMPT # <--- NOM CORRECT
+)
 # Constants
 MAX_CONSECUTIVE_ERRORS = 3
 LLM_TIMEOUT = 90.0  # seconds
@@ -39,6 +36,7 @@ class AgentConfig:
     role: str
     task: str
     budget: float
+    completion_criteria: Optional[Dict[str, Any]] = None  # <--- NOUVELLE LIGNE
     parent_id: Optional[str] = None
     max_subagents: int = 5
     price_per_1m_input_tokens: float = 5.0
@@ -47,15 +45,18 @@ class AgentConfig:
     tool_use_cost: float = 0.005
 
 class Agent:
-    def __init__(self, agent_id: str, config: AgentConfig, ledger, toolbox, orchestrator):
+    def __init__(self, agent_id: str, config: AgentConfig, ledger, toolbox, orchestrator, llm_client):
         self.id = agent_id
         self.config = config
         self.ledger = ledger
         self.toolbox = toolbox
         self.orchestrator = orchestrator
+        self.llm_client = llm_client # <--- NOUVELLE LIGNE
         self.logger = logging.getLogger(f"AOS-Agent-{agent_id}")
         self.state = AgentState.ACTIVE
         self.subagents: List[str] = []
+        # Dictionnaire pour mapper un subagent_id à l'index de l'étape du plan qu'il exécute
+        self.delegated_tasks: Dict[str, int] = {}
         self.thoughts: List[str] = []
         self.results: List[Dict[str, Any]] = []
         self.consecutive_errors = 0
@@ -75,7 +76,15 @@ class Agent:
             return "Out of funds"
         
         prompt = await self._build_prompt(context)
-        response_text, cost = await self._call_llm(prompt)
+
+        # --- MODIFICATION MAJEURE ---
+        # Doit être identique à la logique dans _create_plan
+        response_text, input_tokens, output_tokens = await self.llm_client.call_llm(
+            prompt, self.orchestrator.config.llm
+        )
+        
+        cost = ((input_tokens / 1_000_000) * self.config.price_per_1m_input_tokens) + \
+               ((output_tokens / 1_000_000) * self.config.price_per_1m_output_tokens)
         
         if cost > 0 and not await self.ledger.charge(self.id, cost, TransactionType.API_CALL, "LLM API usage"):
             self.state = AgentState.DEAD
@@ -92,48 +101,66 @@ class Agent:
         
         action_type = action.get("type")
         if action_type == "error": return action
-        elif action_type == "delegate": return await self._delegate_task(action)
+        elif action_type == "delegate": 
+            # On passe l'index de l'étape à la méthode de délégation
+            step_index = action.get("details", {}).get("step_index")
+            return await self._delegate_task(action, step_index)
+
         elif action_type == "use_tool": return await self._use_tool(action)
+        elif action_type == "request_new_tool":
+            return await self._request_new_tool(action)
         elif action_type == "complete": return await self._complete_task(action)
-        elif action_type == "fail": return {"error": thought}
+        elif action_type == "fail": 
+            self.state = AgentState.FAILED # L'action FAIL doit changer l'état
+            return {"error": thought}
         else: return {"error": f"Unknown action type: {action_type}"}
 
     async def run(self) -> Dict[str, Any]:
         self.logger.info(f"Starting main execution loop.")
         
+        # Création du plan si c'est le fondateur
         if self.config.parent_id is None and not self.plan_created:
             await self._create_plan()
+            if self.state != AgentState.ACTIVE: # La planification peut échouer
+                 self.logger.warning("Plan creation failed. Halting execution.")
+                 return {"agent_id": self.id, "state": self.state.value}
+
 
         while self.state == AgentState.ACTIVE:
-            if self.config.parent_id is None:
+            action_to_take = None
+            if self.config.parent_id is None: # Logique du Manager/Fondateur
                 action_to_take = await self._get_next_action_from_plan()
-                if action_to_take:
-                    thought = json.dumps(action_to_take)
-                else:
-                    self.logger.debug("Founder is waiting for sub-agents to complete their tasks.")
-                    if await self._is_task_complete():
-                        self.state = AgentState.COMPLETED
+                if not action_to_take:
+                    # Si pas d'action, le manager attend. On met un petit sleep
+                    # pour ne pas surcharger le CPU.
                     await asyncio.sleep(2)
-                    continue
-            else:
+                    continue # On repart au début de la boucle while
+            else: # Logique de l'Ouvrier/Worker
                 context = f"History of your previous actions and their results: {self.results[-3:]}" if self.results else "This is your first action."
                 thought = await self.think(context)
+                if self.state != AgentState.ACTIVE: break # Le 'think' peut changer l'état (ex: faillite)
+                # L'ouvrier a une action à faire (basée sur sa pensée)
+                result = await self.act(thought)
+                self.results.append(result)
 
-            if self.state != AgentState.ACTIVE: break
-            
-            result = await self.act(thought)
-            self.results.append(result)
+            # Si le manager a une action (DELEGATE), il l'exécute
+            if action_to_take:
+                thought_for_act = json.dumps(action_to_take)
+                result = await self.act(thought_for_act)
+                self.results.append(result)
 
-            if "error" in result:
-                self.logger.error(f"Action error: {result['error']}")
+            # Gestion des erreurs pour tout le monde
+            if "error" in self.results[-1]:
+                self.logger.error(f"Action error: {self.results[-1]['error']}")
                 self.consecutive_errors += 1
-                if self.consecutive_errors >= MAX_CONSECUTIVE_ERRORS: self.state = AgentState.FAILED
+                if self.consecutive_errors >= MAX_CONSECUTIVE_ERRORS: 
+                    self.state = AgentState.FAILED
             else:
                 self.consecutive_errors = 0
             
-            # NEW: Auto-deliver files when task is complete
-            if await self._is_task_complete():
-                await self._deliver_files()
+            # Les ouvriers vérifient s'ils ont terminé leur tâche individuelle
+            if self.config.parent_id is not None and await self._is_task_complete():
+                await self._deliver_files() # <-- Cette logique pourrait être déplacée dans act()
                 self.state = AgentState.COMPLETED
             
             await asyncio.sleep(0.1)
@@ -143,30 +170,131 @@ class Agent:
 
     async def _create_plan(self):
         self.logger.info("Founder is creating a project plan...")
-        # Use the directly imported constant
-        planning_prompt = FOUNDER_PLANNING_PROMPT.format(task=self.config.task)
-        response_text, cost = await self._call_llm(planning_prompt)
-        if cost > 0:
-            await self.ledger.charge(self.id, cost, TransactionType.API_CALL, "Project Planning")
-        try:
-            plan_data = json.loads(response_text)
-            self.plan = plan_data.get("plan", [])
-            self.plan_created = True
-            self.logger.info(f"Project plan created with {len(self.plan)} steps.")
-        except json.JSONDecodeError:
-            self.logger.error("Failed to parse project plan. Agent will fail.")
+        
+        # Phase 1: Génération initiale
+        initial_plan_json = await self._generate_initial_plan()
+        if not initial_plan_json:
             self.state = AgentState.FAILED
+            return
+
+        # Phase 2: Validation et Raffinement (si activé)
+        final_plan_data = initial_plan_json
+        if self.orchestrator.config.capabilities.allow_advanced_planning:
+            self.logger.info("Initiating advanced plan validation...")
+            validation_result = await self._validate_plan(initial_plan_json)
+            
+            if not validation_result.get("is_valid", False):
+                self.logger.warning(f"Plan deemed invalid. Reason: {validation_result.get('reasoning')}. Attempting to refine...")
+                # Ici, on pourrait boucler, mais pour commencer, une seule passe de raffinement est plus simple.
+                final_plan_data = await self._generate_initial_plan(refinement_prompt=validation_result.get('reasoning'))
+        
+        # Phase 3: Traitement du plan final
+        if final_plan_data:
+            plan = final_plan_data.get("plan", [])
+            if plan:
+                self.plan = plan
+                self.plan_created = True
+                self.logger.info(f"Final plan created with {len(self.plan)} steps.")
+                return
+        
+        self.logger.error("Failed to create a valid final plan.")
+        self.state = AgentState.FAILED
+
+    async def _generate_initial_plan(self, refinement_prompt: Optional[str] = None) -> Optional[Dict]:
+        prompt_content = FOUNDER_PLANNING_PROMPT.format(task=self.config.task)
+        if refinement_prompt:
+            prompt_content += f"\n\nPlease refine the plan based on the following feedback: {refinement_prompt}"
+
+        response_text, i, o = await self.llm_client.call_llm(prompt_content, self.orchestrator.config.llm)
+        # ... (calcul du coût et gestion des erreurs de l'appel LLM) ...
+        try:
+            return json.loads(response_text)
+        except json.JSONDecodeError:
+            return None
+
+    async def _validate_plan(self, plan_json: Dict) -> Dict:
+        prompt_content = ARCHITECT_VALIDATION_PROMPT.format(
+            objective=self.config.task,
+            plan_json=json.dumps(plan_json, indent=2)
+        )
+        response_text, i, o = await self.llm_client.call_llm(prompt_content, self.orchestrator.config.llm)
+        # ... (calcul du coût) ...
+        try:
+            return json.loads(response_text)
+        except json.JSONDecodeError:
+            return {"is_valid": False, "reasoning": "Failed to get a valid validation response from architect."}
+
 
     async def _get_next_action_from_plan(self) -> Optional[Dict[str, Any]]:
-        if not self.plan_created or not self.plan: return None
-        completed_subagents = sum(1 for sid in self.subagents if self.orchestrator.agents.get(sid).state != AgentState.ACTIVE)
-        if completed_subagents == len(self.subagents) and len(self.plan) > len(self.subagents):
-            next_step_index = len(self.subagents)
-            self.logger.info(f"Executing step {next_step_index + 1} of the plan.")
-            return self.plan[next_step_index]
-        return None
+        if not self.plan_created or not self.plan:
+            return None
+
+        # 1. Lire les messages et mettre à jour le statut des tâches terminées
+        messages = await self.orchestrator.get_messages(self.id)
+        completed_artifacts = {} # stocke les résultats des tâches finies
+        
+        for msg in messages:
+            sender_id = msg.get("from")
+            content = msg.get("content", {})
+            if sender_id in self.delegated_tasks and content.get("status") == "task_completed":
+                step_index = self.delegated_tasks[sender_id]
+                artifacts = content.get("artifacts", [])
+                completed_artifacts[step_index] = artifacts
+                self.logger.info(f"Step {step_index + 1} confirmed complete by agent {sender_id} with artifacts: {artifacts}")
+                # On pourrait aussi retirer la tâche de `delegated_tasks` pour ne pas la traiter à nouveau
+        
+        # 2. Déterminer la prochaine étape à exécuter
+        # La prochaine étape est la première qui n'a pas encore été déléguée
+        next_step_index = len(self.subagents)
+
+        if next_step_index >= len(self.plan):
+            # Toutes les étapes ont été déléguées. Le manager attend que tout soit fini.
+            all_children_done = all(
+                self.orchestrator.agents.get(sid).state != AgentState.ACTIVE 
+                for sid in self.subagents
+            )
+            if all_children_done:
+                self.logger.info("All plan steps delegated and all agents finished. Founder's task is complete.")
+                self.state = AgentState.COMPLETED
+            return None
+
+        # 3. Vérifier si les dépendances de l'étape suivante sont satisfaites
+        # Logique simple : on ne lance l'étape N que si l'étape N-1 est terminée
+        if next_step_index > 0:
+            previous_step_index = next_step_index - 1
+            previous_agent_id = self.subagents[previous_step_index]
+            
+            # Si l'agent précédent est toujours actif, on attend
+            if self.orchestrator.agents.get(previous_agent_id).state == AgentState.ACTIVE:
+                self.logger.debug(f"Waiting for agent {previous_agent_id} (step {previous_step_index + 1}) to complete.")
+                return None
+
+        # 4. Préparer et retourner l'action de délégation pour la prochaine étape
+        self.logger.info(f"Ready to execute step {next_step_index + 1} of the plan.")
+        
+        next_step_action = self.plan[next_step_index]
+        # Ajouter l'index de l'étape pour le suivi
+        next_step_action["details"]["step_index"] = next_step_index
+
+        # Enrichir la tâche avec le contexte des étapes précédentes
+        if next_step_index > 0 and (next_step_index - 1) in completed_artifacts:
+            artifacts = completed_artifacts[next_step_index - 1]
+            context_for_next_task = f"\n\nCONTEXT FROM PREVIOUS STEP: Your colleague has produced the following artifacts: {artifacts}. You should use them as input."
+            next_step_action["details"]["task"] += context_for_next_task
+            
+        return next_step_action
 
     async def _build_prompt(self, context: str) -> str:
+        # --- NOUVELLE LOGIQUE DE LECTURE DES MESSAGES ---
+        # Dans _build_prompt
+        messages = []
+        if self.orchestrator.config.capabilities.allow_messaging:
+            messages = await self.orchestrator.get_messages(self.id)
+            message_context = ""
+        if messages:
+            formatted_messages = "\n".join([f"- From {m['from']}: {json.dumps(m['content'])}" for m in messages])
+            message_context = f"\n--- NEW MESSAGES ---\nYou have received the following messages:\n{formatted_messages}\n--- END OF MESSAGES ---\n"
+        
         # This method now acts as a router to the correct prompt template
         balance = await self.ledger.get_balance(self.id)
         if self.config.role.lower() == 'founder':
@@ -183,59 +311,10 @@ class Agent:
             # Use directly imported constant
             return WORKER_AGENT_PROMPT.format(
                 role=self.config.role, task=self.config.task, balance=balance, 
-                context=context, tools_formatted=tools_formatted
+                context=context, tools_formatted=tools_formatted,
+                parent_id=self.config.parent_id,
+                message_context=message_context
             )
-
-    async def _call_llm(self, prompt: str) -> Tuple[str, float]:
-        border = "=" * 50
-        self.logger.debug(f"\n{border}\n>>> PROMPT (Agent: {self.id}) >>>\n{border}\n{prompt}\n{border}")
-        if not OPENAI_AVAILABLE:
-            self.logger.warning("OpenAI not available, using fallback response.")
-            return FALLBACK_RESPONSE, 0.0
-
-        model = os.getenv("OPENAI_MODEL", "gpt-4-turbo")
-        api_params = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": "You are a helpful assistant. Respond only in the requested JSON format."},
-                {"role": "user", "content": prompt}
-            ],
-            "temperature": 0.2,
-            "max_tokens": 2048,
-            "timeout": LLM_TIMEOUT,
-            "response_format": {"type": "json_object"}
-        }
-
-        try:
-            response = await asyncio.wait_for(
-                async_openai_client.chat.completions.create(**api_params),
-                timeout=LLM_TIMEOUT + 10.0 # Add a bit more time for network overhead
-            )
-            response_text = response.choices[0].message.content
-            self.logger.debug(f"\n{border}\n<<< RAW RESPONSE (Agent: {self.id}) <<<\n{border}\n{response_text}\n{border}")
-            usage = response.usage
-            if usage:
-                cost = ((usage.prompt_tokens / 1_000_000) * self.config.price_per_1m_input_tokens) + \
-                       ((usage.completion_tokens / 1_000_000) * self.config.price_per_1m_output_tokens)
-                return response_text, cost
-            return response_text, 0.0
-        except asyncio.TimeoutError:
-            self.logger.error(f"LLM call timed out for agent {self.id}")
-            self.state = AgentState.FAILED
-            return f"LLM call timed out after {LLM_TIMEOUT} seconds", 0.0
-        except openai.RateLimitError as e:
-            self.logger.error(f"OpenAI rate limit hit for agent {self.id}: {e}")
-            # Potentially implement retry logic here
-            self.state = AgentState.FAILED
-            return f"OpenAI rate limit error: {e}", 0.0
-        except openai.APIError as e:
-             self.logger.error(f"OpenAI API error for agent {self.id}: {e}")
-             self.state = AgentState.FAILED
-             return f"OpenAI API error: {e}", 0.0
-        except Exception as e:
-            self.state = AgentState.FAILED
-            self.logger.error(f"LLM call failed for agent {self.id}: {e}", exc_info=True)
-            return f"LLM call failed: {e}", 0.0
 
     async def _get_fallback_response(self) -> str:
         return json.dumps({"reasoning": "Fallback.", "action": "COMPLETE"})
@@ -253,7 +332,7 @@ class Agent:
         except (json.JSONDecodeError, ValueError) as e:
             return {"type": "error", "error": f"JSON parse failed: {e}. Raw: '{thought}'"}
 
-    async def _delegate_task(self, action: Dict[str, Any]) -> Dict[str, Any]:
+    async def _delegate_task(self, action: Dict[str, Any], step_index: Optional[int]) -> Dict[str, Any]:
         parent_balance = await self.ledger.get_balance(self.id)
         if parent_balance < self.config.spawn_cost:
             return {"error": "Insufficient funds for spawn cost."}
@@ -266,19 +345,35 @@ class Agent:
             return {"error": "Failed to complete delegation transaction."}
             
         details = action.get("details", {})
-        subagent_id = await self.orchestrator.spawn_agent(
-            role=details.get("role", "Specialist"), 
-            task=details.get("task", "Complete assigned sub-task."), 
-            budget=budget_to_allocate, 
-            parent_id=self.id
-        )
-        
-        if subagent_id == "error_max_agents_reached":
-            await self.ledger.credit(self.id, self.config.spawn_cost + budget_to_allocate, TransactionType.REFUND, "Refund for max agents reached.")
-            return {"error": "Maximum agents reached."}
+        completion_criteria = details.get("completion_criteria") # <--- NOUVELLE LIGNE
 
-        self.subagents.append(subagent_id)
-        return {"action": "delegate", "subagent_id": subagent_id}
+        try:
+            subagent_id = await self.orchestrator.spawn_agent(
+                role=details.get("role", "Specialist"), 
+                task=details.get("task", "Complete assigned sub-task."), 
+                budget=budget_to_allocate, 
+                parent_id=self.id,
+                completion_criteria=completion_criteria # <--- NOUVEAU PARAMÈTRE
+            )
+
+            # Si le spawn réussit, on continue ici
+            self.subagents.append(subagent_id)
+            # Si on a un index, on l'enregistre
+            if step_index is not None:
+                self.delegated_tasks[subagent_id] = step_index
+            return {"action": "delegate", "subagent_id": subagent_id, "step_index": step_index}
+        
+        except MaxAgentsReachedError as e:
+            # Gère l'échec de manière propre si l'exception est levée.
+            self.logger.warning(f"Failed to spawn agent: {e}")
+            await self.ledger.credit(self.id, self.config.spawn_cost + budget_to_allocate, TransactionType.REFUND, "Refund for max agents reached.")
+            return {"error": "Maximum number of agents has been reached.", "details": str(e)}
+        
+        except Exception as e:
+            # Sécurité pour intercepter d'autres erreurs de spawn inattendues
+            self.logger.error(f"An unexpected error occurred during agent spawn: {e}", exc_info=True)
+            await self.ledger.credit(self.id, self.config.spawn_cost + budget_to_allocate, TransactionType.REFUND, "Refund for unexpected spawn failure.")
+            return {"error": "An unexpected error occurred during agent spawn.", "details": str(e)}
 
     async def _use_tool(self, action: Dict[str, Any]) -> Dict[str, Any]:
         tool_name = action.get("tool")
@@ -289,24 +384,64 @@ class Agent:
         result = await self.toolbox.execute_tool(tool_name, parameters, self.id)
         return {"action": "use_tool", "tool": tool_name, "parameters": parameters, "result": result}
 
+    async def _request_new_tool(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        """Handles the agent's request to create a new tool."""
+        description = action.get("details", {}).get("description")
+        if not description:
+            return {"error": "Tool description is required to request a new tool."}
+        
+        self.logger.info(f"Requesting creation of a new tool: '{description}'")
+        
+        # Délègue la gestion de la requête à l'orchestrateur
+        await self.orchestrator.handle_tool_request(self.id, description)
+        
+        # L'agent a soumis sa requête. Il doit maintenant attendre.
+        # On retourne un résultat pour l'historique.
+        return {"action": "request_new_tool", "status": "request_submitted", "description": description}
+    
     async def _complete_task(self, action: Dict[str, Any]) -> Dict[str, Any]:
         self.state = AgentState.COMPLETED
         return {"action": "complete"}
 
     async def _is_task_complete(self) -> bool:
-        if self.config.parent_id is None: # Founder logic
+        # La logique du Founder reste la même : il est complet quand tous ses enfants le sont.
+        if self.config.parent_id is None: 
             if not self.plan_created or not self.plan: return False
             all_steps_delegated = len(self.subagents) == len(self.plan)
             if not all_steps_delegated: return False
-            return all(self.orchestrator.agents.get(sid).state != AgentState.ACTIVE for sid in self.subagents if sid in self.orchestrator.agents)
+            return all(
+                sid in self.orchestrator.agents and self.orchestrator.agents.get(sid).state != AgentState.ACTIVE
+                for sid in self.subagents
+            )
         
-        role = self.config.role.lower() # Worker logic
-        if 'developer' in role or 'designer' in role:
-            return any(res.get("action") == "use_tool" and res.get("tool") == "file_manager" and res.get("result", {}).get("status") == "success" for res in self.results)
-        
-        return len([r for r in self.results if "error" not in r]) >= 2
-    
+        # Logique pour les agents ouvriers/workers
+        criteria = self.config.completion_criteria
+        if not criteria:
+            # Fallback si aucun critère n'est défini (comportement ancien, plus sûr de le garder)
+            return len([r for r in self.results if "error" not in r]) >= 2
 
+        # Vérification dynamique des critères
+        # Nous allons vérifier si une des actions passées correspond parfaitement au critère.
+        # Pour une robustesse accrue, on pourrait faire une comparaison de sous-dictionnaire.
+        for result in reversed(self.results): # On part de la fin, c'est plus probable
+            if "error" in result:
+                continue
+
+            action_taken = {
+                "action": result.get("action"),
+                "tool": result.get("tool"),
+                "parameters": result.get("parameters", {})
+            }
+
+            # Comparaison simple pour l'instant
+            if (action_taken["action"] == criteria.get("action") and
+                action_taken["tool"] == criteria.get("tool") and
+                action_taken["parameters"] == criteria.get("parameters")):
+                self.logger.info(f"Completion criteria met: {criteria}")
+                return True
+        
+        return False
+    
     # Add a new method for automatic file delivery
     async def _deliver_files(self) -> None:
         """Automatically deliver created files to the delivery folder."""

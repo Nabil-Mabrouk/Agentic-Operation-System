@@ -1,0 +1,79 @@
+<!-- visualizer/index.html -->
+<!DOCTYPE html>
+<html>
+<head>
+    <title>AOS Live Visualizer</title>
+    <!-- Import de vis.js -->
+    <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+    <style type="text/css">
+        body, html { font-family: sans-serif; margin: 0; padding: 0; height: 100%; }
+        #mynetwork { width: 100%; height: 95vh; border: 1px solid lightgray; }
+        #status { height: 5vh; line-height: 5vh; padding-left: 10px; background-color: #f0f0f0; }
+    </style>
+</head>
+<body>
+    <div id="status">Status: Connecting...</div>
+    <div id="mynetwork"></div>
+
+    <script type="text/javascript">
+        // Configuration des couleurs par état
+        const STATE_COLORS = {
+            active: { background: '#97C2FC', border: '#2B7CE9' },
+            completed: { background: '#A1DE93', border: '#5DBB63' },
+            failed: { background: '#FB7E81', border: '#FA0A10' },
+            dead: { background: '#C0C0C0', border: '#808080' }
+        };
+
+        const container = document.getElementById('mynetwork');
+        const statusDiv = document.getElementById('status');
+        
+        // Création des datasets pour les noeuds et les arêtes
+        const nodes = new vis.DataSet([]);
+        const edges = new vis.DataSet([]);
+
+        const data = { nodes: nodes, edges: edges };
+        const options = {
+            layout: { hierarchical: { direction: 'UD', sortMethod: 'directed' } },
+            edges: { arrows: 'to' },
+            physics: { enabled: false }
+        };
+        const network = new vis.Network(container, data, options);
+
+        function connect() {
+            const socket = new WebSocket('ws://localhost:8765');
+
+            socket.onopen = () => statusDiv.textContent = 'Status: Connected to AOS Orchestrator';
+            socket.onclose = () => {
+                statusDiv.textContent = 'Status: Disconnected. Retrying in 3s...';
+                setTimeout(connect, 3000);
+            };
+            socket.onerror = (error) => statusDiv.textContent = `Status: Error - ${error.message}`;
+            
+            socket.onmessage = (event) => {
+                const msg = JSON.parse(event.data);
+                
+                if (msg.type === 'agent_created') {
+                    const { node, edge } = msg.payload;
+                    node.color = STATE_COLORS[node.state] || STATE_COLORS.active;
+                    nodes.update(node);
+                    if (edge) edges.update(edge);
+                } 
+                else if (msg.type === 'agent_state_changed') {
+                    const { id, state } = msg.payload;
+                    nodes.update({ id: id, color: STATE_COLORS[state] || STATE_COLORS.active });
+                }
+                else if (msg.type === 'full_sync') {
+                    const { nodes: newNodes, edges: newEdges } = msg.payload;
+                    newNodes.forEach(n => n.color = STATE_COLORS[n.state] || STATE_COLORS.active);
+                    nodes.clear();
+                    edges.clear();
+                    nodes.add(newNodes);
+                    edges.add(newEdges);
+                }
+            };
+        }
+
+        connect();
+    </script>
+</body>
+</html>

@@ -3,38 +3,60 @@ import os
 import logging
 from typing import Dict, Any, List, Optional
 import asyncio
+import importlib # <--- NOUVEL IMPORT
+import inspect   # <--- NOUVEL IMPORT
 
 from .tools.base_tool import BaseTool, ToolError
 
 class Toolbox:
     """A collection of tools sandboxed to a specific agent's workspace."""
     
-    def __init__(self, workspace_dir: str, delivery_folder: Optional[str] = None):
+    def __init__(self, workspace_dir: str, delivery_folder: Optional[str] = None, orchestrator: Optional[Any] = None):
         self.logger = logging.getLogger("AOS-Toolbox")
         self.tools: Dict[str, BaseTool] = {}
         self.workspace_dir = workspace_dir
         self.delivery_folder = delivery_folder
         self._lock = asyncio.Lock()  # Ensure thread safety for tool registration
+        self.orchestrator = orchestrator # Stocker l'orchestrateur
         
+    # --- MÉTHODE D'INITIALISATION ENTIÈREMENT REVUE ---
     async def initialize(self) -> None:
-        """Initialize the toolbox with tools configured for its workspace."""
+        """Dynamically discover and load tools from the plugins directory."""
         self.logger.info(f"Initializing toolbox for workspace: {self.workspace_dir}")
-        from aos.tools import WebSearchTool, CodeExecutorTool, FileManagerTool
+        self.tools = {} # Réinitialiser les outils
         
-        builtin_tools = [
-            WebSearchTool(),
-            CodeExecutorTool(),
-            FileManagerTool(workspace_dir=self.workspace_dir, delivery_folder=self.delivery_folder)
-        ]
+        plugins_path = os.path.join(os.path.dirname(__file__), 'tools', 'plugins')
+        plugin_files = [f for f in os.listdir(plugins_path) if f.endswith('.py') and not f.startswith('__')]
+
+        for file_name in plugin_files:
+            module_name = f"aos.tools.plugins.{file_name[:-3]}"
+            try:
+                module = importlib.import_module(module_name)
+                for name, obj in inspect.getmembers(module):
+                    # On cherche les classes qui héritent de BaseTool mais qui ne sont pas BaseTool elles-mêmes
+                    if inspect.isclass(obj) and issubclass(obj, BaseTool) and obj is not BaseTool:
+                        self.logger.debug(f"Found tool class: {obj.__name__} in {module_name}")
+                        
+                        # Instancier l'outil. Gérer le cas de FileManagerTool qui a des arguments.
+                        if obj.__name__ == "FileManagerTool":
+                            tool_instance = obj(workspace_dir=self.workspace_dir, delivery_folder=self.delivery_folder)
+                        else:
+                            tool_instance = obj()
+                        
+                        # Dans la boucle de chargement dynamique
+                        if obj.__name__ == "MessagingTool" and not self.orchestrator.config.capabilities.allow_messaging:
+                            continue # On saute le chargement de cet outil
+
+                        await self.register_tool(tool_instance)
+                        
+            except ImportError as e:
+                self.logger.error(f"Failed to import plugin module {module_name}: {e}")
+
+        self.logger.info(f"Toolbox initialized with {len(self.tools)} tools: {list(self.tools.keys())}")
         
-        for tool in builtin_tools:
-            await self.register_tool(tool)
-        self.logger.info(f"Toolbox initialized with {len(self.tools)} tools.")
-        
-        # Create delivery folder if specified
+        # La création du delivery folder reste
         if self.delivery_folder:
             os.makedirs(self.delivery_folder, exist_ok=True)
-            self.logger.info(f"Delivery folder created at: {self.delivery_folder}")
             
     async def register_tool(self, tool: BaseTool) -> None:
         async with self._lock:
@@ -42,7 +64,17 @@ class Toolbox:
                 self.logger.warning(f"Tool '{tool.name}' is already registered. Overwriting.")
             self.tools[tool.name] = tool
             self.logger.debug(f"Registered tool: {tool.name}")
-            
+
+    async def refresh(self):
+        """
+        Re-scans the plugins directory and loads any new tools,
+        preserving the existing ones.
+        """
+        self.logger.info("Refreshing toolbox by reloading all tools...")
+        # La manière la plus simple et la plus sûre est de ré-appeler initialize.
+        # Cela garantit que tous les nouveaux outils sont chargés.
+        await self.initialize()          
+    
     async def get_tool(self, name: str) -> Optional[BaseTool]:
         return self.tools.get(name)
         
@@ -63,7 +95,7 @@ class Toolbox:
         
         self.logger.info(f"Agent {agent_id} executing tool: {name} with params: {parameters}")
         try:
-            result = await tool.execute(parameters, agent_id)
+            result = await tool.execute(parameters, agent_id, self.orchestrator)
             self.logger.debug(f"Tool {name} executed successfully for agent {agent_id}. Result: {result}")
             return result
         except Exception as e:
