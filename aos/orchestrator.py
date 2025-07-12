@@ -1,20 +1,22 @@
 #aos/orchestrator.py
+# aos/orchestrator.py
 import asyncio
 import logging
 import uuid
 import os
 import shutil
-from typing import Dict, Any, List, Optional
+import re
+import json
+from collections import deque
+from typing import Dict, Any, List, Optional, Deque
+
 from .agent import Agent, AgentConfig, AgentState
 from .config import SystemConfig
 from .ledger import Ledger
 from .toolbox import Toolbox
 from .exceptions import MaxAgentsReachedError
+from .llm_clients.base import BaseLLMClient
 import websockets
-import json
-from .llm_clients.base import BaseLLMClient # <--- NOUVEL IMPORT
-from collections import deque # Utiliser une deque pour une performance optimale
-import shutil
 
 # Constants
 SIMULATION_TIMEOUT = 600.0  # seconds
@@ -38,6 +40,8 @@ class Orchestrator:
         self.websocket_server = None
         self.connected_clients = set()
         self.mailboxes: Dict[str, deque[Dict[str, Any]]] = {}
+        # Ensemble des descriptions d'outils dont la création est déjà en cours
+        self.pending_tool_requests: Dict[str, str] = {}
 
     async def _notify_clients(self, event: Dict[str, Any]):
         """Envoie un événement JSON à tous les clients connectés."""
@@ -76,7 +80,6 @@ class Orchestrator:
         ]
         return {"nodes": nodes, "edges": edges}
 
-
     async def initialize(self) -> None:
         self.logger.info("Orchestrator initialized")
         self.system_start_time = asyncio.get_event_loop().time()
@@ -112,46 +115,51 @@ class Orchestrator:
         )
         return await self._create_agent(agent_config)
 
+# Dans la classe Orchestrator
     async def _create_agent(self, config: AgentConfig) -> str:
         """Creates an agent, its dedicated toolbox, and its workspace."""
-
         async with self._agent_creation_lock:
             if len(self.agents) >= self.config.max_agents:
-                # Lève une exception claire au lieu de retourner une chaîne.
                 raise MaxAgentsReachedError(f"Cannot spawn new agent. The system limit of {self.config.max_agents} agents has been reached.")
 
-        agent_id = str(uuid.uuid4())[:8]
-        # --- NOUVEAUTÉ : CRÉER UNE BOÎTE AUX LETTRES POUR LE NOUVEL AGENT ---
-        self.mailboxes[agent_id] = deque()
-        agent_workspace = os.path.join(self.config.workspace_path, agent_id)
-        os.makedirs(agent_workspace, exist_ok=True)
+            agent_id = str(uuid.uuid4())[:8]
+            self.mailboxes[agent_id] = deque()
+            
+            agent_workspace = os.path.join(self.config.workspace_path, agent_id)
+            os.makedirs(agent_workspace, exist_ok=True)
+            
+            # --- LOGIQUE DE PRIVILÈGE POUR LE FORGERON ---
+            # Sauvegarder la config des outils désactivés
+            original_disabled_tools = list(self.config.disabled_tools)
+            is_forger = config.role == "Tool Forging Agent"
+            if is_forger:
+                # Le forgeron ne doit avoir aucun outil désactivé pour pouvoir travailler
+                self.config.disabled_tools = []
+                self.logger.info(f"Granting temporary full tool access to Tool Forging Agent {agent_id}.")
 
-        agent_toolbox = Toolbox(workspace_dir=agent_workspace, delivery_folder=self.config.delivery_path, orchestrator=self)
-        await agent_toolbox.initialize()
-        self.logger.debug(f"Initialized toolbox for agent {agent_id} in workspace '{agent_workspace}'")
-        self.logger.info(f"Creating agent {agent_id} with role '{config.role}' in workspace '{agent_workspace}'")
+            agent_toolbox = Toolbox(
+                workspace_dir=agent_workspace,
+                delivery_folder=self.config.delivery_path,
+                orchestrator=self
+            )
+            await agent_toolbox.initialize()
+            
+            # Restaurer la configuration originale après l'initialisation du toolbox
+            self.config.disabled_tools = original_disabled_tools
+            # --- FIN DE LA LOGIQUE DE PRIVILÈGE ---
 
-        agent = self.AgentClass(
-            agent_id=agent_id, 
-            config=config, 
-            ledger=self.ledger, 
-            toolbox=agent_toolbox,
-            orchestrator=self,
-            llm_client=self.llm_client # <--- PASSE LE CLIENT À L'AGENT
-        )
-        await agent.initialize()
-        self.agents[agent_id] = agent
-        self.logger.info(f"Agent {agent_id} ({config.role}) created with workspace '{agent_workspace}'")
-
-        # --- NOTIFICATION ---
-        await self._notify_clients({
-            "type": "agent_created",
-            "payload": {
-                "node": {"id": agent_id, "label": f"{config.role}\n({agent_id})", "title": config.task, "state": "active"},
-                "edge": {"from": config.parent_id, "to": agent_id} if config.parent_id else None
-            }
-        })
-        return agent_id
+            agent = self.AgentClass(
+                agent_id=agent_id, 
+                config=config, 
+                ledger=self.ledger, 
+                toolbox=agent_toolbox,
+                orchestrator=self,
+                llm_client=self.llm_client
+            )
+            await agent.initialize()
+            self.agents[agent_id] = agent
+            self.logger.info(f"Agent {agent_id} ({config.role}) created with workspace '{agent_workspace}'")
+            return agent_id
     
     # --- NOUVELLE MÉTHODE POUR LA COMMUNICATION ---
     async def send_message(self, sender_id: str, recipient_id: str, content: Dict[str, Any]):
@@ -211,7 +219,6 @@ class Orchestrator:
         await self._cancel_all_running_tasks()
         self.logger.info("Orchestrator event loop finished. Collecting results.")
         return await self._collect_results()
-
 
     def _get_active_tasks(self) -> List[asyncio.Task]:
         return [task for task in self.running_tasks.values() if not task.done()]
@@ -306,43 +313,72 @@ class Orchestrator:
             await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
         self.logger.info("Orchestrator shutdown complete")
 
+# Dans la classe Orchestrator
     async def handle_tool_request(self, requester_id: str, description: str):
         """
         Handles a request from an agent to create a new tool by spawning a ToolForgingAgent.
         """
         # 1. Vérifier si la fonctionnalité est activée
         if not self.config.capabilities.allow_tool_creation:
-            self.logger.warning(
-                f"Agent {requester_id} requested a new tool, but creation is disabled by system configuration."
-            )
-            # Envoyer un message en retour à l'agent demandeur pour qu'il sache que sa requête est refusée
+            self.logger.warning(f"Agent {requester_id} requested a new tool, but creation is disabled.")
             await self.send_message(
                 sender_id="AOS_SYSTEM", 
                 recipient_id=requester_id,
-                content={
-                    "status": "tool_request_denied", 
-                    "reason": "Tool creation is disabled in the system configuration."
-                }
+                content={"status": "tool_request_denied", "reason": "Tool creation is disabled."}
+            )
+            return
+            
+        # 2. Vérification anti-spam
+        if requester_id in self.pending_tool_requests:
+            self.logger.warning(f"Agent {requester_id} already has a pending tool request. Ignoring duplicate.")
+            await self.send_message(
+                sender_id="AOS_SYSTEM",
+                recipient_id=requester_id,
+                content={"status": "tool_request_duplicate", "reason": "A tool request is already being processed."}
             )
             return
 
-        self.logger.info(f"Tool request from {requester_id} approved. Spawning a Tool Forging Agent.")
+        self.pending_tool_requests[requester_id] = description
+        self.logger.info(f"Tool request for '{description}' from {requester_id} approved. Spawning a Tool Forging Agent.")
+
+        # 3. Préparer un Toolbox temporaire pour éduquer le Forgeron
+        forger_toolbox = Toolbox(workspace_dir="temp_forger_space", orchestrator=self)
+        original_disabled_tools = list(self.config.disabled_tools)
+        self.config.disabled_tools = [] # Le forgeron doit voir tous les outils pour son prompt
+        await forger_toolbox.initialize()
+        self.config.disabled_tools = original_disabled_tools
         
+        tools_for_forger_prompt = await forger_toolbox.list_tools_for_prompt()
+        tools_for_forger_json = json.dumps(tools_for_forger_prompt, indent=2)
+
+        # 4. Définir la tâche précise pour l'agent forgeron
         # 2. Définir la tâche précise pour l'agent forgeron
-        # Ce prompt est crucial pour guider le forgeron.
         forging_task = (
             f"An agent has requested a new tool with the following description: '{description}'.\n"
-            "Your mission is to fulfill this request by following these steps precisely:\n"
-            "1.  **Design the Tool**: Based on the description, design a Python class that inherits from `BaseTool` from `aos.tools.base_tool`. It must have `__init__`, `get_schema`, and `execute` methods. The tool code must be self-contained and use only standard Python libraries.\n"
-            "2.  **Write the Tool Code**: Use the `file_manager` to write the complete Python code for the tool into a file named `new_tool.py`.\n"
-            "3.  **Write a Test**: Create a simple but effective test for the new tool using `pytest`. The test should validate the tool's core functionality. Save this test code into a file named `test_new_tool.py`.\n"
-            "4.  **Validate your Work**: Use the `code_executor` tool to run `pytest` on your test file (`pytest test_new_tool.py`). The output must show that the test passed.\n"
-            "5.  **Report Success**: If the test passes, use the `messaging` tool to send a final report to your parent agent (ID: {parent_id}) with the exact content: `{{'status': 'tool_creation_success', 'tool_code_path': 'new_tool.py', 'test_code_path': 'test_new_tool.py'}}`."
+            "Your mission is to create and validate this tool. You MUST follow these steps SEQUENTIALLY and EXACTLY. Do not skip any steps.\n\n"
+            "--- STEP 1: WRITE THE TOOL ---\n"
+            "Based on the description, write the complete Python code for a new tool class that inherits from `BaseTool`. "
+            "Save this code into a file named `new_tool.py` using the `file_manager` tool.\n\n"
+            
+            "--- STEP 2: WRITE THE TEST ---\n"
+            "Create a test file named `test_new_tool.py` using `pytest` conventions. This test MUST be robust enough to validate the tool's core functionality.\n\n"
+
+            "--- STEP 3: EXECUTE THE TEST ---\n"
+            "This is a CRITICAL VALIDATION step. You MUST use the `pytest_runner` tool to execute `test_new_tool.py`. "
+            "You will analyze the result from `pytest_runner`.\n\n"
+
+            "--- STEP 4: FINAL REPORT ---\n"
+            "**IF AND ONLY IF** the `return_code` from the `pytest_runner` in STEP 3 was `0`, you must send a success message to your parent agent (ID: {parent_id}). "
+            "The message MUST have the exact content: `{{'status': 'tool_creation_success', 'tool_code_path': 'new_tool.py'}}`. "
+            "If the test failed, you must instead send a failure message: `{{'status': 'tool_creation_failed', 'reason': 'The created tool did not pass its own tests.'}}`\n\n"
+
+            "--- YOUR AVAILABLE TOOLS ---\n"
+            f"{tools_for_forger_json}\n"
+            "--- END OF TOOLS ---"
         )
 
-        # 3. Spawner l'agent forgeron
-        # L'agent demandeur devient le "manager" temporaire du forgeron pour recevoir le rapport.
-        forger_budget = self.config.initial_budget * 0.2 # Allouer un budget conséquent
+        # 5. Spawner l'agent forgeron
+        forger_budget = self.config.initial_budget * 0.2
         await self.spawn_agent(
             role="Tool Forging Agent",
             task=forging_task,
@@ -350,49 +386,80 @@ class Orchestrator:
             parent_id=requester_id 
         )
 
+# Dans la classe Orchestrator
+    def _extract_tool_description_from_task(self, forger_task: str) -> Optional[str]:
+        """
+        Extracts the original tool description from the forging agent's task prompt
+        using regular expressions. This is a helper method for _process_system_events.
+        """
+        # Looks for the text between single quotes after 'description:'
+        match = re.search(r"description: '(.*?)'", forger_task, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+        
+        self.logger.warning("Could not extract original tool description from forger's task.")
+        return None
+
     async def _process_system_events(self):
         """
-        Scans mailboxes for system-level messages, like tool creation reports,
-        and triggers corresponding actions.
+        Scans all mailboxes for system-level messages (like tool creation reports)
+        and triggers corresponding orchestrator actions (like deployment).
+        This method is designed to be safe against race conditions.
         """
-        # On itère sur une copie pour pouvoir modifier le dictionnaire si besoin
-        for agent_id, mailbox in list(self.mailboxes.items()):
+        # Iterate over a copy of agent IDs to handle potential modifications
+        for agent_id in list(self.agents.keys()):
+            # Check if the agent and its mailbox exist
             agent = self.agents.get(agent_id)
-            # On s'intéresse uniquement aux messages envoyés par les Forgerons
-            if not agent or agent.config.role != "Tool Forging Agent":
+            if not agent or agent_id not in self.mailboxes:
                 continue
 
-            # On ne veut pas vider la boîte aux lettres du manager, mais celle du forgeron
-            # Ici, le forgeron envoie un message à son parent (l'agent demandeur).
-            # La logique doit donc être de lire la boîte du *parent*.
-            parent_id = agent.config.parent_id
-            if not parent_id or parent_id not in self.mailboxes:
+            # Read the agent's entire mailbox once
+            messages_to_process = await self.get_messages(agent_id)
+            if not messages_to_process:
                 continue
 
-            messages_to_process = await self.get_messages(parent_id)
+            messages_to_keep_for_agent = []  # List for non-system messages
+
             for msg in messages_to_process:
-                # On vérifie que le message vient bien du forgeron
-                if msg.get("from") != agent_id:
-                    # Ce n'est pas le bon message, on le remet dans la boîte
-                    await self.send_message(msg['from'], parent_id, msg['content'])
-                    continue
-
+                sender_id = msg.get("from")
                 content = msg.get("content", {})
-                if content.get("status") == "tool_creation_success":
-                    self.logger.info(f"Detected successful tool creation report from {agent_id}.")
+                sender_agent = self.agents.get(sender_id)
+
+                # Identify a system message: a successful tool creation report from a Forging Agent
+                is_system_message = (
+                    sender_agent and
+                    sender_agent.config.role == "Tool Forging Agent" and
+                    content.get("status") == "tool_creation_success"
+                )
+
+                if is_system_message:
+                    self.logger.info(f"Orchestrator detected successful tool creation report from {sender_id} in {agent_id}'s mailbox.")
                     tool_path = content.get("tool_code_path")
                     
-                    # Déclencher le déploiement
-                    await self._deploy_new_tool(agent_id, parent_id, tool_path)
+                    # Trigger deployment
+                    await self._deploy_new_tool(sender_id, agent_id, tool_path)
                     
-                    # Le travail du forgeron est terminé
-                    agent.state = AgentState.COMPLETED
+                    # Clean up the pending request
+                    original_description = self._extract_tool_description_from_task(sender_agent.config.task)
+                    if original_description:
+                        self.pending_tool_requests.discard(original_description)
+
+                    # The forger's job is done
+                    sender_agent.state = AgentState.COMPLETED
+                else:
+                    # If it's not a system message, keep it for the agent to process
+                    messages_to_keep_for_agent.append(msg)
+            
+            # Put back any non-system messages into the agent's mailbox
+            if messages_to_keep_for_agent:
+                # Use extendleft with reversed list to preserve the original order
+                self.mailboxes[agent_id].extendleft(reversed(messages_to_keep_for_agent))
 
     async def _deploy_new_tool(self, forger_agent_id: str, requester_agent_id: str, tool_path_in_workspace: str):
-        """Deploys a new tool created by an agent."""
+        """Deploys a new tool created by an agent by copying it to the plugins directory."""
         self.logger.info(f"Deploying new tool '{tool_path_in_workspace}' from agent {forger_agent_id}...")
         
-        # 1. Construire les chemins
+        # 1. Build paths
         forger_workspace = os.path.join(self.config.workspace_path, forger_agent_id)
         source_path = os.path.join(forger_workspace, tool_path_in_workspace)
         
@@ -401,12 +468,12 @@ class Orchestrator:
             return
 
         tool_name = os.path.basename(tool_path_in_workspace).replace('.py', '')
-        # Nom de fichier unique pour éviter les conflits
+        # Create a unique filename to avoid conflicts
         dest_filename = f"generated_{tool_name}_{forger_agent_id}.py"
         plugins_dir = os.path.join(os.path.dirname(__file__), 'tools', 'plugins')
         dest_path = os.path.join(plugins_dir, dest_filename)
 
-        # 2. Copier le fichier de l'outil dans le répertoire des plugins
+        # 2. Copy the tool file to the plugins directory
         try:
             shutil.copy(source_path, dest_path)
             self.logger.info(f"New tool '{dest_filename}' deployed to plugins directory.")
@@ -414,10 +481,15 @@ class Orchestrator:
             self.logger.error(f"Failed to copy new tool to plugins directory: {e}")
             return
 
-        # 3. Forcer tous les Toolboxes à se rafraîchir
+        # 3. Refresh all toolboxes so they discover the new tool
         await self._refresh_all_toolboxes()
+        # --- NOUVELLE LOGIQUE ---
+        # Retirer la requête de la liste d'attente une fois l'outil déployé
+        if requester_agent_id in self.pending_tool_requests:
+            del self.pending_tool_requests[requester_agent_id]
+            self.logger.info(f"Cleared pending tool request for agent {requester_agent_id}.")
 
-        # 4. Notifier l'agent demandeur que son outil est prêt
+        # 4. Notify the original agent that its requested tool is ready
         await self.send_message(
             sender_id="AOS_SYSTEM",
             recipient_id=requester_agent_id,

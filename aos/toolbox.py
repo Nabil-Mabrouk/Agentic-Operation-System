@@ -42,7 +42,10 @@ class Toolbox:
                             tool_instance = obj(workspace_dir=self.workspace_dir, delivery_folder=self.delivery_folder)
                         else:
                             tool_instance = obj()
-                        
+                            
+                        # Le PytestRunnerTool est un outil système et ne peut pas être désactivé
+                        is_protected_tool = tool_instance.name == "pytest_runner"
+
                         if tool_instance.name in self.orchestrator.config.disabled_tools:
                             self.logger.warning(f"Tool '{tool_instance.name}' is disabled by configuration. Skipping.")
                             continue # On ne charge pas cet outil    

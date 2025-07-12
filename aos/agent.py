@@ -82,6 +82,11 @@ class Agent:
         response_text, input_tokens, output_tokens = await self.llm_client.call_llm(
             prompt, self.orchestrator.config.llm
         )
+        if response_text is None:
+            self.logger.error("Received a None response from the LLM client.")
+            # Pour generate_plan, on retourne None et _create_plan gère déjà ça.
+            # Pour think, on doit retourner un JSON d'erreur valide.
+            return '{"reasoning": "LLM response was empty.", "action": "FAIL"}' 
         
         cost = ((input_tokens / 1_000_000) * self.config.price_per_1m_input_tokens) + \
                ((output_tokens / 1_000_000) * self.config.price_per_1m_output_tokens)
@@ -118,62 +123,76 @@ class Agent:
     async def run(self) -> Dict[str, Any]:
         self.logger.info(f"Starting main execution loop.")
         
-        # Création du plan si c'est le fondateur
+        # Phase de planification pour le Fondateur
         if self.config.parent_id is None and not self.plan_created:
             await self._create_plan()
-            if self.state != AgentState.ACTIVE: # La planification peut échouer
-                 self.logger.warning("Plan creation failed. Halting execution.")
-                 return {"agent_id": self.id, "state": self.state.value}
+            if self.state != AgentState.ACTIVE:
+                self.logger.warning("Plan creation failed. Halting agent execution.")
+                return {"agent_id": self.id, "state": self.state.value}
 
-
+        # Boucle principale d'exécution
         while self.state == AgentState.ACTIVE:
-            action_to_take = None
-            if self.config.parent_id is None: # Logique du Manager/Fondateur
-                action_to_take = await self._get_next_action_from_plan()
-                if not action_to_take:
-                    # Si pas d'action, le manager attend. On met un petit sleep
-                    # pour ne pas surcharger le CPU.
+            
+            # 1. DÉCISION : Que faire ce tour-ci ?
+            thought_or_action = None
+            is_manager_action = False
+            
+            if self.config.parent_id is None: # Logique du Manager
+                thought_or_action = await self._get_next_action_from_plan()
+                is_manager_action = True
+                if not thought_or_action:
+                    # Le manager attend, il n'y a rien à faire ce tour-ci
                     await asyncio.sleep(2)
-                    continue # On repart au début de la boucle while
-            else: # Logique de l'Ouvrier/Worker
+                    continue
+            else: # Logique de l'Ouvrier
                 context = f"History of your previous actions and their results: {self.results[-3:]}" if self.results else "This is your first action."
-                thought = await self.think(context)
-                if self.state != AgentState.ACTIVE: break # Le 'think' peut changer l'état (ex: faillite)
-                # L'ouvrier a une action à faire (basée sur sa pensée)
-                result = await self.act(thought)
-                self.results.append(result)
-
-            # Si le manager a une action (DELEGATE), il l'exécute
-            if action_to_take:
-                thought_for_act = json.dumps(action_to_take)
-                result = await self.act(thought_for_act)
-                self.results.append(result)
-
-            # Gestion des erreurs pour tout le monde
-            if "error" in self.results[-1]:
-                self.logger.error(f"Action error: {self.results[-1]['error']}")
+                thought_or_action = await self.think(context)
+                if self.state != AgentState.ACTIVE: # Le 'think' peut changer l'état
+                    break
+            
+            # 2. VÉRIFICATION DE LA VALIDITÉ DE LA PENSÉE/ACTION
+            if not thought_or_action:
+                self.logger.warning("Agent produced an empty thought or action. Retrying.")
                 self.consecutive_errors += 1
-                if self.consecutive_errors >= MAX_CONSECUTIVE_ERRORS: 
-                    self.state = AgentState.FAILED
             else:
-                self.consecutive_errors = 0
+                # 3. ACTION : Exécuter l'action décidée
+                # Si c'est le manager, on transforme son action en chaîne JSON pour 'act'
+                # Si c'est l'ouvrier, on passe directement sa pensée.
+                action_input = json.dumps(thought_or_action) if is_manager_action else thought_or_action
+                
+                result = await self.act(action_input)
+                self.results.append(result)
+
+                # 4. GESTION DU RÉSULTAT
+                if "error" in result:
+                    self.logger.error(f"Action resulted in an error: {result['error']}")
+                    self.consecutive_errors += 1
+                else:
+                    self.consecutive_errors = 0 # Réinitialiser en cas de succès
+
+            # 5. GESTION DES ERREURS CONSECUTIVES
+            if self.consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                self.logger.error(f"Exceeded max consecutive errors ({MAX_CONSECUTIVE_ERRORS}). Agent is failing.")
+                self.state = AgentState.FAILED
             
-            # Les ouvriers vérifient s'ils ont terminé leur tâche individuelle
+            # 6. VÉRIFICATION DE LA FIN DE TÂCHE (pour les ouvriers)
             if self.config.parent_id is not None and await self._is_task_complete():
-                await self._deliver_files() # <-- Cette logique pourrait être déplacée dans act()
+                await self._deliver_files() 
                 self.state = AgentState.COMPLETED
-            
+
+            # Petit temps de pause pour éviter de surcharger le CPU
             await asyncio.sleep(0.1)
         
-        self.logger.info(f"Finished execution with state: {self.state.value}")
+        # Fin de la boucle
+        self.logger.info(f"Finished execution with final state: {self.state.value}")
         return {"agent_id": self.id, "state": self.state.value}
-
     async def _create_plan(self):
         self.logger.info("Founder is creating a project plan...")
         
         # Phase 1: Génération initiale
         initial_plan_json = await self._generate_initial_plan()
         if not initial_plan_json:
+            self.logger.error("Initial plan generation failed. Halting.")
             self.state = AgentState.FAILED
             return
 
@@ -207,9 +226,20 @@ class Agent:
 
         response_text, i, o = await self.llm_client.call_llm(prompt_content, self.orchestrator.config.llm)
         # ... (calcul du coût et gestion des erreurs de l'appel LLM) ...
+        if response_text is None:
+            self.logger.error("Received a None response from the LLM client.")
+            # Pour generate_plan, on retourne None et _create_plan gère déjà ça.
+            # Pour think, on doit retourner un JSON d'erreur valide.
+            return '{"reasoning": "LLM response was empty.", "action": "FAIL"}' 
         try:
-            return json.loads(response_text)
-        except json.JSONDecodeError:
+            data = json.loads(response_text)
+            # On vérifie si la réponse est une erreur de l'API que nous avons formatée
+            if isinstance(data, dict) and data.get("action") == "FAIL":
+                self.logger.error(f"LLM client returned a failure state: {data.get('reasoning')}")
+                return None
+            return data
+        except (json.JSONDecodeError, TypeError):
+            self.logger.error(f"Failed to parse LLM response into JSON: {response_text}")
             return None
 
     async def _validate_plan(self, plan_json: Dict) -> Dict:
